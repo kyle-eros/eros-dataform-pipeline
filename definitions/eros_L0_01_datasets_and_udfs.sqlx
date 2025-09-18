@@ -19,84 +19,84 @@ config {
 -- =====================================================================
 
 -- L0: Raw ingestion and staging
-CREATE SCHEMA IF NOT EXISTS `layer_00_ingestion`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_00_ingestion`
 OPTIONS (
   description = "Raw data ingestion, staging tables, and initial processing",
   location = "US"
 );
 
 -- L1: Semantic truth layer
-CREATE SCHEMA IF NOT EXISTS `layer_01_semantic`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_01_semantic`
 OPTIONS (
   description = "Business logic layer with stable views, facts, and dimensions",
   location = "US"
 );
 
 -- L2: Feature engineering
-CREATE SCHEMA IF NOT EXISTS `layer_02_features`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_02_features`
 OPTIONS (
   description = "Advanced feature engineering for ML and decision making",
   location = "US"
 );
 
 -- L3: Decision engine
-CREATE SCHEMA IF NOT EXISTS `layer_03_decisions`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_03_decisions`
 OPTIONS (
   description = "Core decision engine with A/B testing and recommendations",
   location = "US"
 );
 
 -- L4: Machine Learning
-CREATE SCHEMA IF NOT EXISTS `layer_04_ml`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_04_ml`
 OPTIONS (
   description = "BigQuery ML models and Vertex AI integration",
   location = "US"
 );
 
 -- L5: Serving layer
-CREATE SCHEMA IF NOT EXISTS `layer_05_serving`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_05_serving`
 OPTIONS (
   description = "Real-time serving tables for scheduler interfaces",
   location = "US"
 );
 
 -- L6: Analytics and monitoring
-CREATE SCHEMA IF NOT EXISTS `layer_06_analytics`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_06_analytics`
 OPTIONS (
   description = "KPIs, alerts, and performance monitoring",
   location = "US"
 );
 
 -- L7: Governance and security
-CREATE SCHEMA IF NOT EXISTS `layer_07_governance`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_07_governance`
 OPTIONS (
   description = "Data governance, masking, and access control",
   location = "US"
 );
 
 -- L8: Experimentation
-CREATE SCHEMA IF NOT EXISTS `layer_08_experiments`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_08_experiments`
 OPTIONS (
   description = "A/B testing framework and experiment management",
   location = "US"
 );
 
 -- L9: Operations
-CREATE SCHEMA IF NOT EXISTS `layer_09_operations`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_09_operations`
 OPTIONS (
   description = "Lifecycle management, backfills, and maintenance",
   location = "US"
 );
 
 -- L10: Metadata
-CREATE SCHEMA IF NOT EXISTS `layer_10_metadata`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.layer_10_metadata`
 OPTIONS (
   description = "Data catalog, documentation, and lineage",
   location = "US"
 );
 
 -- Reference data
-CREATE SCHEMA IF NOT EXISTS `reference`
+CREATE SCHEMA IF NOT EXISTS `of-scheduler-proj.reference`
 OPTIONS (
   description = "Reference data and lookup tables",
   location = "US"
@@ -171,7 +171,7 @@ LANGUAGE js AS """
   if (!text) return 0;
 
   // Unicode emoji ranges
-  const emojiRegex = /[\\u{1F600}-\\u{1F64F}]|[\\u{1F300}-\\u{1F5FF}]|[\\u{1F680}-\\u{1F6FF}]|[\\u{1F1E0}-\\u{1F1FF}]|[\\u{2600}-\\u{26FF}]|[\\u{2700}-\\u{27BF}]/gu;
+  const emojiRegex = /[\\u{1F600}-\\u{1F64F}]|[\\u{1F300}-\\u{1F5FF}]|[\\u{1F680}-\\u{1F6FF}]|[\\u{1F1E0]-\\u{1F1FF}]|[\\u{2600}-\\u{26FF}]|[\\u{2700}-\\u{27BF}]/gu;
 
   const matches = text.match(emojiRegex);
   return matches ? matches.length : 0;
