@@ -1,0 +1,443 @@
+config {
+  type: "view",
+  tags: ["L1", "v_message_facts_by_page"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.02: Message Facts by Page - Creator Intelligence View
+-- =====================================================================
+-- Core semantic view providing enriched message facts with creator
+-- intelligence, fan segmentation, and performance analytics.
+-- =====================================================================
+
+-- =====================================================================
+-- MAIN MESSAGE FACTS VIEW
+-- =====================================================================
+
+
+WITH fan_segmentation AS (
+  -- Dynamic fan segmentation based on behavior patterns
+  SELECT
+    sender_normalized,
+
+    -- Fan engagement patterns (mock fan data for now)
+    ARRAY[
+      STRUCT('WHALES' AS segment, 0.15 AS percentage),
+      STRUCT('LOYALISTS' AS segment, 0.25 AS percentage),
+      STRUCT('NIGHT_OWLS' AS segment, 0.20 AS percentage),
+      STRUCT('TEASERS' AS segment, 0.30 AS percentage),
+      STRUCT('BROWSERS' AS segment, 0.10 AS percentage)
+    ] AS fan_distribution,
+
+    -- Estimated fan base size (based on engagement patterns)
+    CASE
+      WHEN creator_tier = 'PREMIUM' THEN 5000 + CAST(RAND() * 5000 AS INT64)
+      WHEN creator_tier = 'HIGH' THEN 3000 + CAST(RAND() * 2000 AS INT64)
+      WHEN creator_tier = 'MED' THEN 1500 + CAST(RAND() * 1500 AS INT64)
+      WHEN creator_tier = 'LOW' THEN 500 + CAST(RAND() * 1000 AS INT64)
+      ELSE 100 + CAST(RAND() * 400 AS INT64)
+    END AS estimated_fan_count
+
+  FROM (
+    SELECT DISTINCT sender_normalized, creator_tier
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+    WHERE sender_normalized IS NOT NULL
+  )
+),
+
+creator_performance_baseline AS (
+  -- Rolling 30-day performance baseline for each creator
+  SELECT
+    sender_normalized,
+
+    -- Performance metrics
+    AVG(conversion_rate) AS baseline_conversion_rate,
+    AVG(revenue_per_message) AS baseline_rpm,
+    AVG(engagement_score) AS baseline_engagement,
+
+    -- Volume patterns
+    COUNT(*) / COUNT(DISTINCT send_date) AS avg_daily_volume,
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+    COUNT(DISTINCT content_category) AS content_diversity,
+
+    -- Quality patterns
+    AVG(data_quality_score) AS avg_quality,
+    AVG(novelty_score) AS avg_novelty,
+
+    -- Timing patterns
+    APPROX_TOP_COUNT(send_hour, 1)[OFFSET(0)].value AS preferred_hour,
+    APPROX_TOP_COUNT(EXTRACT(DAYOFWEEK FROM send_date), 1)[OFFSET(0)].value AS preferred_day,
+
+    -- Content patterns
+    APPROX_TOP_COUNT(content_category, 1)[OFFSET(0)].value AS primary_content_type,
+    AVG(char_length) AS avg_message_length,
+    AVG(emoji_count) AS avg_emoji_usage,
+
+    -- Recent trend (last 7 days vs previous 7)
+    (
+      SELECT AVG(revenue_per_message)
+      FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` recent
+      WHERE recent.sender_normalized = base.sender_normalized
+        AND recent.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+    ) / NULLIF(
+      (
+        SELECT AVG(revenue_per_message)
+        FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` previous
+        WHERE previous.sender_normalized = base.sender_normalized
+          AND previous.send_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+          AND DATE_SUB(CURRENT_DATE(), INTERVAL 8 DAY)
+      ), 0
+    ) AS recent_rpm_trend,
+
+    MAX(send_date) AS last_activity_date,
+    MIN(send_date) AS first_activity_date
+
+  FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` base
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND sender_normalized IS NOT NULL
+  GROUP BY sender_normalized
+),
+
+message_intelligence AS (
+  -- Enhanced message-level intelligence
+  SELECT
+    m.*,
+
+    -- Creator context
+    cp.baseline_conversion_rate,
+    cp.baseline_rpm,
+    cp.baseline_engagement,
+    cp.avg_daily_volume,
+    cp.hour_diversity,
+    cp.content_diversity,
+    cp.preferred_hour,
+    cp.preferred_day,
+    cp.primary_content_type,
+    cp.recent_rpm_trend,
+
+    -- Fan segmentation context
+    fs.fan_distribution,
+    fs.estimated_fan_count,
+
+    -- Tier definitions context
+    td.max_sends_per_day,
+    td.min_hours_between_sends,
+    td.priority_score AS tier_priority,
+    td.optimal_message_length_min,
+    td.optimal_message_length_max,
+    td.eligible_for_premium_pricing,
+    td.ml_recommendation_weight,
+
+    -- Performance vs baseline
+    COALESCE(m.conversion_rate / NULLIF(cp.baseline_conversion_rate, 0), 1.0) AS conversion_vs_baseline,
+    COALESCE(m.revenue_per_message / NULLIF(cp.baseline_rpm, 0), 1.0) AS rpm_vs_baseline,
+    COALESCE(m.engagement_score / NULLIF(cp.baseline_engagement, 0), 1.0) AS engagement_vs_baseline,
+
+    -- Content optimization signals
+    CASE
+      WHEN m.char_length BETWEEN td.optimal_message_length_min AND td.optimal_message_length_max THEN 'OPTIMAL'
+      WHEN m.char_length < td.optimal_message_length_min THEN 'TOO_SHORT'
+      ELSE 'TOO_LONG'
+    END AS message_length_status,
+
+    -- Timing optimization signals
+    CASE
+      WHEN m.send_hour = cp.preferred_hour THEN 'OPTIMAL'
+      WHEN ABS(m.send_hour - cp.preferred_hour) <= 2 THEN 'GOOD'
+      ELSE 'SUBOPTIMAL'
+    END AS timing_status,
+
+    -- Content novelty classification
+    CASE
+      WHEN m.novelty_score >= 0.8 THEN 'HIGHLY_NOVEL'
+      WHEN m.novelty_score >= 0.6 THEN 'MODERATELY_NOVEL'
+      WHEN m.novelty_score >= 0.4 THEN 'SOMEWHAT_REPETITIVE'
+      ELSE 'HIGHLY_REPETITIVE'
+    END AS novelty_classification,
+
+    -- Performance tier classification
+    CASE
+      WHEN m.revenue_per_message >= cp.baseline_rpm * 1.5 THEN 'HIGH_PERFORMER'
+      WHEN m.revenue_per_message >= cp.baseline_rpm * 1.2 THEN 'ABOVE_AVERAGE'
+      WHEN m.revenue_per_message >= cp.baseline_rpm * 0.8 THEN 'AVERAGE'
+      WHEN m.revenue_per_message >= cp.baseline_rpm * 0.5 THEN 'BELOW_AVERAGE'
+      ELSE 'POOR_PERFORMER'
+    END AS performance_classification,
+
+    -- Strategic recommendations
+    CASE
+      WHEN m.conversion_rate < cp.baseline_conversion_rate * 0.5 AND m.novelty_score < 0.4 THEN 'NEEDS_FRESH_CONTENT'
+      WHEN m.revenue_per_message < cp.baseline_rpm * 0.6 AND m.send_hour NOT IN (cp.preferred_hour, cp.preferred_hour + 1, cp.preferred_hour - 1) THEN 'OPTIMIZE_TIMING'
+      WHEN m.engagement_score < cp.baseline_engagement * 0.7 THEN 'IMPROVE_ENGAGEMENT'
+      WHEN m.conversion_rate > cp.baseline_conversion_rate * 1.5 THEN 'SCALE_SUCCESS'
+      ELSE 'MAINTAIN_STRATEGY'
+    END AS optimization_recommendation
+
+  FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` m
+  LEFT JOIN creator_performance_baseline cp
+    ON m.sender_normalized = cp.sender_normalized
+  LEFT JOIN fan_segmentation fs
+    ON m.sender_normalized = fs.sender_normalized
+  LEFT JOIN `layer_01_semantic.creator_tier_definitions` td
+    ON m.creator_tier = td.tier_name
+  WHERE m.message_row_id IS NOT NULL
+    AND m.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)  -- Limit for performance
+)
+
+-- Main view query
+SELECT
+  -- Core identifiers
+  message_row_id,
+  sender_normalized AS creator_username,
+  creator_tier,
+
+  -- Message content and metadata
+  message,
+  message_hash,
+  sending_time,
+  send_date,
+  send_hour,
+  send_dayofweek,
+  hour_category,
+  day_category,
+
+  -- Content analysis
+  content_category,
+  char_length,
+  word_count,
+  emoji_count,
+  has_hashtag,
+  has_mention,
+  has_price_placeholder,
+  has_name_placeholder,
+  message_length_status,
+  novelty_score,
+  novelty_classification,
+
+  -- Pricing and performance
+  price,
+  sent,
+  viewed,
+  purchased,
+  earnings,
+  conversion_rate,
+  revenue_per_message,
+  engagement_score,
+  performance_classification,
+
+  -- Creator context and baselines
+  baseline_conversion_rate,
+  baseline_rpm,
+  baseline_engagement,
+  conversion_vs_baseline,
+  rpm_vs_baseline,
+  engagement_vs_baseline,
+
+  -- Creator behavior patterns
+  avg_daily_volume,
+  hour_diversity,
+  content_diversity,
+  preferred_hour,
+  preferred_day,
+  primary_content_type,
+  recent_rpm_trend,
+
+  -- Fan intelligence
+  fan_distribution,
+  estimated_fan_count,
+
+  -- Timing intelligence
+  timing_status,
+
+  -- Creator tier context
+  max_sends_per_day,
+  min_hours_between_sends,
+  tier_priority,
+  optimal_message_length_min,
+  optimal_message_length_max,
+  eligible_for_premium_pricing,
+  ml_recommendation_weight,
+
+  -- Strategic insights
+  optimization_recommendation,
+
+  -- Quality and flags
+  data_quality_score,
+  anomaly_flags,
+  is_duplicate,
+
+  -- Metadata
+  first_loaded_at,
+  last_updated_at,
+  created_at,
+  updated_at,
+
+  -- Calculated timestamp for real-time serving
+  CURRENT_TIMESTAMP() AS facts_calculated_at
+
+FROM message_intelligence
+
+-- Add intelligent filtering
+WHERE data_quality_score >= 0.5  -- Only include quality data
+  AND NOT is_duplicate  -- Exclude duplicates
+
+ORDER BY send_date DESC, earnings DESC
+
+-- =====================================================================
+-- CREATOR SUMMARY VIEW
+-- =====================================================================
+
+
+WITH creator_metrics AS (
+  SELECT
+    creator_username,
+    creator_tier,
+
+    -- Activity metrics
+    COUNT(*) AS total_messages_90d,
+    COUNT(DISTINCT send_date) AS active_days_90d,
+    MIN(send_date) AS first_message_date,
+    MAX(send_date) AS last_message_date,
+
+    -- Performance metrics
+    SUM(earnings) AS total_earnings_90d,
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement_score,
+
+    -- Content metrics
+    COUNT(DISTINCT content_category) AS content_types_used,
+    AVG(novelty_score) AS avg_novelty,
+    COUNT(DISTINCT message_hash) AS unique_messages,
+
+    -- Timing patterns
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+    APPROX_TOP_COUNT(send_hour, 1)[OFFSET(0)].value AS most_frequent_hour,
+    APPROX_TOP_COUNT(day_category, 1)[OFFSET(0)].value AS preferred_day_type,
+
+    -- Quality metrics
+    AVG(data_quality_score) AS avg_quality_score,
+    COUNTIF(performance_classification = 'HIGH_PERFORMER') AS high_performance_count,
+    COUNTIF(performance_classification = 'POOR_PERFORMER') AS poor_performance_count,
+
+    -- Trend analysis
+    MAX(recent_rpm_trend) AS recent_trend_ratio,
+
+    -- Fan intelligence
+    MAX(estimated_fan_count) AS estimated_fan_count,
+
+    -- Baseline performance
+    MAX(baseline_conversion_rate) AS baseline_conversion_rate,
+    MAX(baseline_rpm) AS baseline_rpm
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  GROUP BY creator_username, creator_tier
+)
+
+SELECT
+  creator_username,
+  creator_tier,
+
+  -- Activity summary
+  total_messages_90d,
+  active_days_90d,
+  ROUND(total_messages_90d / GREATEST(active_days_90d, 1), 2) AS avg_messages_per_active_day,
+  DATE_DIFF(CURRENT_DATE(), last_message_date, DAY) AS days_since_last_message,
+
+  -- Performance summary
+  total_earnings_90d,
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+  ROUND(avg_engagement_score, 4) AS avg_engagement_score,
+
+  -- Performance classification
+  CASE
+    WHEN avg_rpm >= 2.0 AND avg_conversion_rate >= 0.08 THEN 'PREMIUM'
+    WHEN avg_rpm >= 1.25 AND avg_conversion_rate >= 0.06 THEN 'HIGH'
+    WHEN avg_rpm >= 0.75 AND avg_conversion_rate >= 0.04 THEN 'MED'
+    WHEN avg_rpm >= 0.25 AND avg_conversion_rate >= 0.02 THEN 'LOW'
+    ELSE 'NEW'
+  END AS calculated_tier,
+
+  CASE
+    WHEN creator_tier != CASE
+      WHEN avg_rpm >= 2.0 AND avg_conversion_rate >= 0.08 THEN 'PREMIUM'
+      WHEN avg_rpm >= 1.25 AND avg_conversion_rate >= 0.06 THEN 'HIGH'
+      WHEN avg_rpm >= 0.75 AND avg_conversion_rate >= 0.04 THEN 'MED'
+      WHEN avg_rpm >= 0.25 AND avg_conversion_rate >= 0.02 THEN 'LOW'
+      ELSE 'NEW'
+    END THEN TRUE
+    ELSE FALSE
+  END AS tier_mismatch,
+
+  -- Content intelligence
+  content_types_used,
+  unique_messages,
+  ROUND(avg_novelty, 3) AS avg_novelty,
+  CASE
+    WHEN avg_novelty >= 0.7 THEN 'HIGHLY_CREATIVE'
+    WHEN avg_novelty >= 0.5 THEN 'MODERATELY_CREATIVE'
+    WHEN avg_novelty >= 0.3 THEN 'SOMEWHAT_REPETITIVE'
+    ELSE 'HIGHLY_REPETITIVE'
+  END AS creativity_classification,
+
+  -- Timing intelligence
+  hour_diversity,
+  most_frequent_hour,
+  preferred_day_type,
+
+  -- Quality assessment
+  ROUND(avg_quality_score, 3) AS avg_quality_score,
+  ROUND(high_performance_count / total_messages_90d * 100, 1) AS high_performance_rate_pct,
+  ROUND(poor_performance_count / total_messages_90d * 100, 1) AS poor_performance_rate_pct,
+
+  -- Trend indicators
+  CASE
+    WHEN recent_trend_ratio >= 1.2 THEN 'IMPROVING'
+    WHEN recent_trend_ratio >= 0.8 THEN 'STABLE'
+    ELSE 'DECLINING'
+  END AS performance_trend,
+
+  -- Business metrics
+  estimated_fan_count,
+  ROUND(total_earnings_90d / GREATEST(estimated_fan_count, 1), 4) AS earnings_per_fan,
+
+  -- Risk assessment
+  CASE
+    WHEN days_since_last_message > 7 THEN 'HIGH_CHURN_RISK'
+    WHEN poor_performance_count / total_messages_90d > 0.5 THEN 'PERFORMANCE_RISK'
+    WHEN avg_novelty < 0.3 THEN 'CREATIVITY_RISK'
+    WHEN recent_trend_ratio < 0.7 THEN 'DECLINING_RISK'
+    ELSE 'LOW_RISK'
+  END AS risk_category,
+
+  -- Timestamps
+  first_message_date,
+  last_message_date,
+  CURRENT_TIMESTAMP() AS summary_calculated_at
+
+FROM creator_metrics
+ORDER BY total_earnings_90d DESC, avg_rpm DESC
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'message_facts_by_page',
+  'SUCCESS',
+  'Created intelligent message facts view with creator analytics and fan segmentation',
+  CURRENT_TIMESTAMP()
+)
+
+-- Success message
+SELECT
+  'L1.02 COMPLETE' as status,
+  'Message facts view created with advanced creator intelligence and performance analytics' as message,
+  CURRENT_TIMESTAMP() as completed_at

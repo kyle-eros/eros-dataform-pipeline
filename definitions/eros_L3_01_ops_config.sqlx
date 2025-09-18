@@ -1,0 +1,450 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L3", "ops_config"],
+  dependencies: ["eros_L2_01_udf_slot_score_v2", "eros_L2_07_next24_candidates_and_bundle"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L3.01: Operations Configuration - Decision Engine Foundation
+-- =====================================================================
+-- Operational configuration for the intelligent decision engine including
+-- A/B testing framework, business rules, and optimization parameters.
+-- =====================================================================
+
+-- =====================================================================
+-- A/B TESTING FRAMEWORK CONFIGURATION
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_03_decisions.ab_test_configurations` (
+  test_id STRING NOT NULL,
+  test_name STRING NOT NULL,
+  test_category STRING NOT NULL,  -- TIMING, CONTENT, PRICING, FREQUENCY
+
+  -- Test parameters
+  test_description TEXT,
+  hypothesis TEXT,
+  success_metrics ARRAY<STRING>,
+
+  -- Test design
+  control_group_config JSON,
+  treatment_groups_config JSON,
+  traffic_allocation JSON,  -- Percentage splits
+
+  -- Targeting criteria
+  creator_tiers ARRAY<STRING>,
+  content_categories ARRAY<STRING>,
+  fan_segments ARRAY<STRING>,
+
+  -- Test lifecycle
+  status STRING DEFAULT 'DRAFT',  -- DRAFT, ACTIVE, PAUSED, COMPLETED, CANCELLED
+  start_date DATE,
+  end_date DATE,
+  min_sample_size INT64,
+  confidence_level NUMERIC DEFAULT 0.95,
+
+  -- Results tracking
+  statistical_significance_reached BOOL DEFAULT FALSE,
+  winning_variant STRING,
+  lift_percentage NUMERIC,
+
+  -- Metadata
+  created_by STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY test_category, status
+OPTIONS (
+  description = "A/B testing framework configuration and management"
+);
+
+-- Insert sample A/B test configurations
+INSERT INTO `layer_03_decisions.ab_test_configurations` VALUES
+(
+  'TIMING_PEAK_HOURS_001',
+  'Peak Hours Optimization',
+  'TIMING',
+  'Test whether expanding peak hours definition improves performance',
+  'Expanding peak hours from 3 to 5 hours will increase overall RPM by 15%',
+  ['avg_rpm', 'conversion_rate', 'total_earnings'],
+  JSON '{"peak_hours": [19, 20, 21], "description": "Traditional 3-hour peak"}',
+  JSON '[{"variant": "extended_peak", "peak_hours": [18, 19, 20, 21, 22], "description": "Extended 5-hour peak"}]',
+  JSON '{"control": 0.5, "extended_peak": 0.5}',
+  ['PREMIUM', 'HIGH'],
+  ['PPV', 'CUSTOM'],
+  ['WHALES', 'LOYALISTS'],
+  'ACTIVE',
+  CURRENT_DATE(),
+  DATE_ADD(CURRENT_DATE(), INTERVAL 30 DAY),
+  1000,
+  0.95,
+  FALSE,
+  NULL,
+  NULL,
+  'SYSTEM',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+),
+(
+  'CONTENT_NOVELTY_002',
+  'High Novelty Content Performance',
+  'CONTENT',
+  'Test whether prioritizing high novelty content improves engagement',
+  'Prioritizing content with novelty score > 0.7 will increase conversion by 20%',
+  ['conversion_rate', 'engagement_score', 'repeat_engagement'],
+  JSON '{"min_novelty_score": 0.4, "description": "Standard novelty threshold"}',
+  JSON '[{"variant": "high_novelty", "min_novelty_score": 0.7, "description": "High novelty content only"}]',
+  JSON '{"control": 0.4, "high_novelty": 0.6}',
+  ['HIGH', 'MED'],
+  ['PPV', 'BUMP', 'CUSTOM'],
+  ['ALL'],
+  'ACTIVE',
+  CURRENT_DATE(),
+  DATE_ADD(CURRENT_DATE(), INTERVAL 21 DAY),
+  500,
+  0.90,
+  FALSE,
+  NULL,
+  NULL,
+  'SYSTEM',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+),
+(
+  'PRICING_DYNAMIC_003',
+  'Dynamic Pricing vs Fixed Pricing',
+  'PRICING',
+  'Test dynamic pricing based on fan segment vs fixed pricing',
+  'Dynamic pricing will increase revenue per message by 25%',
+  ['avg_rpm', 'total_earnings', 'fan_satisfaction'],
+  JSON '{"pricing_strategy": "fixed", "ppv_price": 10, "description": "Fixed $10 PPV pricing"}',
+  JSON '[{"variant": "dynamic_segment", "pricing_strategy": "dynamic", "whale_price": 15, "loyalist_price": 12, "teaser_price": 8, "description": "Segment-based dynamic pricing"}]',
+  JSON '{"control": 0.3, "dynamic_segment": 0.7}',
+  ['PREMIUM', 'HIGH', 'MED'],
+  ['PPV'],
+  ['WHALES', 'LOYALISTS', 'TEASERS'],
+  'DRAFT',
+  DATE_ADD(CURRENT_DATE(), INTERVAL 7 DAY),
+  DATE_ADD(CURRENT_DATE(), INTERVAL 37 DAY),
+  750,
+  0.95,
+  FALSE,
+  NULL,
+  NULL,
+  'SYSTEM',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+);
+
+-- =====================================================================
+-- OPERATIONAL PARAMETERS TABLE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_03_decisions.operational_parameters` (
+  parameter_category STRING NOT NULL,
+  parameter_name STRING NOT NULL,
+  parameter_value STRING NOT NULL,
+  data_type STRING NOT NULL,  -- STRING, NUMERIC, BOOLEAN, JSON, ARRAY
+
+  -- Context and scope
+  scope STRING DEFAULT 'GLOBAL',  -- GLOBAL, CREATOR_TIER, CREATOR_SPECIFIC
+  scope_value STRING,  -- Specific tier or creator if scoped
+
+  -- Parameter metadata
+  description TEXT,
+  default_value STRING,
+  valid_values ARRAY<STRING>,
+  min_value NUMERIC,
+  max_value NUMERIC,
+
+  -- Versioning and lifecycle
+  version INT64 DEFAULT 1,
+  is_active BOOL DEFAULT TRUE,
+  effective_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  expiry_date TIMESTAMP,
+
+  -- Change tracking
+  changed_by STRING,
+  change_reason TEXT,
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY parameter_category, scope
+OPTIONS (
+  description = "Operational parameters for decision engine configuration"
+);
+
+-- Insert operational parameters
+INSERT INTO `layer_03_decisions.operational_parameters` VALUES
+-- Global timing parameters
+('TIMING', 'DEFAULT_PEAK_HOURS', '[11,12,13,19,20,21,22]', 'ARRAY', 'GLOBAL', NULL, 'Default peak sending hours for optimal engagement', '[19,20,21]', NULL, 0, 23, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Initial configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('TIMING', 'MIN_HOURS_BETWEEN_SENDS', '4.0', 'NUMERIC', 'GLOBAL', NULL, 'Minimum hours between sends to prevent fatigue', '6.0', NULL, 1.0, 48.0, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Initial configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('TIMING', 'MAX_SENDS_PER_DAY', '6', 'NUMERIC', 'GLOBAL', NULL, 'Maximum sends per day across all creators', '4', NULL, 1, 12, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Initial configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+
+-- Creator tier specific parameters
+('FREQUENCY', 'MAX_SENDS_PER_DAY', '8', 'NUMERIC', 'CREATOR_TIER', 'PREMIUM', 'Maximum sends per day for premium creators', '6', NULL, 1, 10, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Premium tier configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('FREQUENCY', 'MAX_SENDS_PER_DAY', '6', 'NUMERIC', 'CREATOR_TIER', 'HIGH', 'Maximum sends per day for high tier creators', '5', NULL, 1, 8, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'High tier configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('FREQUENCY', 'MAX_SENDS_PER_DAY', '4', 'NUMERIC', 'CREATOR_TIER', 'MED', 'Maximum sends per day for medium tier creators', '4', NULL, 1, 6, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Medium tier configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('FREQUENCY', 'MAX_SENDS_PER_DAY', '3', 'NUMERIC', 'CREATOR_TIER', 'LOW', 'Maximum sends per day for low tier creators', '3', NULL, 1, 4, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Low tier configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+
+-- Quality thresholds
+('QUALITY', 'MIN_SLOT_SCORE', '0.4', 'NUMERIC', 'GLOBAL', NULL, 'Minimum slot score required for sending', '0.3', NULL, 0.0, 1.0, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Quality threshold', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('QUALITY', 'MIN_NOVELTY_SCORE', '0.3', 'NUMERIC', 'GLOBAL', NULL, 'Minimum novelty score for content reuse', '0.2', NULL, 0.0, 1.0, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Novelty threshold', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('QUALITY', 'MIN_CONFIDENCE_SCORE', '0.6', 'NUMERIC', 'GLOBAL', NULL, 'Minimum confidence score for automated decisions', '0.5', NULL, 0.0, 1.0, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Confidence threshold', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+
+-- A/B testing parameters
+('AB_TESTING', 'DEFAULT_TEST_DURATION_DAYS', '21', 'NUMERIC', 'GLOBAL', NULL, 'Default A/B test duration in days', '14', NULL, 7, 90, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'A/B testing configuration', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('AB_TESTING', 'MIN_SAMPLE_SIZE', '100', 'NUMERIC', 'GLOBAL', NULL, 'Minimum sample size per variant for statistical significance', '50', NULL, 10, 10000, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Statistical requirements', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('AB_TESTING', 'SIGNIFICANCE_THRESHOLD', '0.95', 'NUMERIC', 'GLOBAL', NULL, 'Statistical significance threshold for test conclusions', '0.90', NULL, 0.80, 0.99, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Statistical requirements', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+
+-- Machine learning parameters
+('ML', 'MODEL_REFRESH_HOURS', '24', 'NUMERIC', 'GLOBAL', NULL, 'Hours between ML model refresh cycles', '48', NULL, 1, 168, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'ML operations', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('ML', 'FEATURE_IMPORTANCE_THRESHOLD', '0.05', 'NUMERIC', 'GLOBAL', NULL, 'Minimum feature importance for inclusion in models', '0.01', NULL, 0.001, 0.5, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Feature selection', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('ML', 'PREDICTION_CONFIDENCE_THRESHOLD', '0.7', 'NUMERIC', 'GLOBAL', NULL, 'Minimum confidence for ML predictions', '0.6', NULL, 0.5, 0.95, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'ML confidence', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+
+-- Risk management
+('RISK', 'MAX_EXPERIMENTAL_TRAFFIC', '0.3', 'NUMERIC', 'GLOBAL', NULL, 'Maximum percentage of traffic for experimental features', '0.2', NULL, 0.05, 0.5, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Risk management', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('RISK', 'PERFORMANCE_DECLINE_THRESHOLD', '0.2', 'NUMERIC', 'GLOBAL', NULL, 'Performance decline threshold for automatic intervention', '0.15', NULL, 0.05, 0.5, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Performance monitoring', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+
+-- Business rules
+('BUSINESS', 'QUIET_HOURS_START', '2', 'NUMERIC', 'GLOBAL', NULL, 'Global quiet hours start (24h format)', '1', NULL, 0, 23, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Quiet hours policy', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('BUSINESS', 'QUIET_HOURS_END', '7', 'NUMERIC', 'GLOBAL', NULL, 'Global quiet hours end (24h format)', '6', NULL, 0, 23, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Quiet hours policy', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()),
+('BUSINESS', 'WEEKEND_BOOST_FACTOR', '1.1', 'NUMERIC', 'GLOBAL', NULL, 'Performance boost factor for weekend sends', '1.0', NULL, 0.8, 2.0, 1, TRUE, CURRENT_TIMESTAMP(), NULL, 'SYSTEM', 'Weekend optimization', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP());
+
+-- =====================================================================
+-- DECISION RULES ENGINE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_03_decisions.decision_rules` (
+  rule_id STRING DEFAULT GENERATE_UUID(),
+  rule_name STRING NOT NULL,
+  rule_category STRING NOT NULL,  -- APPROVAL, REJECTION, MODIFICATION, OPTIMIZATION
+
+  -- Rule definition
+  conditions JSON NOT NULL,  -- Complex conditions in JSON format
+  actions JSON NOT NULL,     -- Actions to take when conditions are met
+
+  -- Rule metadata
+  priority INT64 DEFAULT 100,  -- Lower number = higher priority
+  is_active BOOL DEFAULT TRUE,
+
+  -- Scope and applicability
+  applicable_tiers ARRAY<STRING>,
+  applicable_content_types ARRAY<STRING>,
+  applicable_time_ranges JSON,
+
+  -- Performance tracking
+  times_triggered INT64 DEFAULT 0,
+  successful_applications INT64 DEFAULT 0,
+
+  -- Rule lifecycle
+  effective_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  effective_until TIMESTAMP,
+
+  created_by STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY rule_category, priority
+OPTIONS (
+  description = "Business rules engine for automated decision making"
+);
+
+-- Insert decision rules
+INSERT INTO `layer_03_decisions.decision_rules` VALUES
+(
+  GENERATE_UUID(),
+  'High Performance Content Approval',
+  'APPROVAL',
+  JSON '{"conditions": [{"field": "slot_score", "operator": ">=", "value": 0.8}, {"field": "confidence_score", "operator": ">=", "value": 0.7}, {"field": "fatigue_level", "operator": "=", "value": "NO_FATIGUE"}]}',
+  JSON '{"action": "AUTO_APPROVE", "reason": "High performance content with high confidence", "escalation_required": false}',
+  10,  -- High priority
+  TRUE,
+  ['PREMIUM', 'HIGH', 'MED'],
+  ['PPV', 'CUSTOM', 'TIP'],
+  JSON '{"allowed_hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]}',
+  0, 0,
+  CURRENT_TIMESTAMP(), NULL,
+  'SYSTEM', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+),
+(
+  GENERATE_UUID(),
+  'Fatigue Prevention Block',
+  'REJECTION',
+  JSON '{"conditions": [{"field": "hours_since_last_send", "operator": "<", "value": 3}, {"field": "creator_tier", "operator": "!=", "value": "PREMIUM"}]}',
+  JSON '{"action": "BLOCK", "reason": "Fatigue prevention - too frequent sending", "suggested_delay_hours": 4}',
+  5,   -- Very high priority
+  TRUE,
+  ['HIGH', 'MED', 'LOW', 'NEW'],
+  ['ALL'],
+  JSON '{"allowed_hours": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]}',
+  0, 0,
+  CURRENT_TIMESTAMP(), NULL,
+  'SYSTEM', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+),
+(
+  GENERATE_UUID(),
+  'Quiet Hours Enforcement',
+  'REJECTION',
+  JSON '{"conditions": [{"field": "candidate_hour", "operator": ">=", "value": 2}, {"field": "candidate_hour", "operator": "<=", "value": 7}]}',
+  JSON '{"action": "BLOCK", "reason": "Quiet hours policy violation", "suggested_alternative_hours": [8, 9, 10, 19, 20, 21]}',
+  1,   -- Highest priority
+  TRUE,
+  ['ALL'],
+  ['ALL'],
+  JSON '{"quiet_hours": {"start": 2, "end": 7}}',
+  0, 0,
+  CURRENT_TIMESTAMP(), NULL,
+  'SYSTEM', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+),
+(
+  GENERATE_UUID(),
+  'Low Performance Content Review',
+  'MODIFICATION',
+  JSON '{"conditions": [{"field": "slot_score", "operator": "<", "value": 0.5}, {"field": "content_usage_count", "operator": ">", "value": 10}]}',
+  JSON '{"action": "SUGGEST_ALTERNATIVES", "reason": "Low performing content with high usage", "require_human_review": true, "suggest_content_refresh": true}',
+  50,
+  TRUE,
+  ['ALL'],
+  ['ALL'],
+  JSON '{"review_required": true}',
+  0, 0,
+  CURRENT_TIMESTAMP(), NULL,
+  'SYSTEM', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+),
+(
+  GENERATE_UUID(),
+  'Premium Creator Optimization',
+  'OPTIMIZATION',
+  JSON '{"conditions": [{"field": "creator_tier", "operator": "=", "value": "PREMIUM"}, {"field": "primary_fan_segment", "operator": "=", "value": "WHALES"}, {"field": "slot_score", "operator": ">=", "value": 0.6}]}',
+  JSON '{"action": "OPTIMIZE_FOR_PREMIUM", "reason": "Premium creator with whale audience", "price_boost_factor": 1.3, "content_priority": "HIGH"}',
+  20,
+  TRUE,
+  ['PREMIUM'],
+  ['PPV', 'CUSTOM'],
+  JSON '{"premium_hours": [11, 12, 13, 19, 20, 21, 22]}',
+  0, 0,
+  CURRENT_TIMESTAMP(), NULL,
+  'SYSTEM', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+);
+
+-- =====================================================================
+-- PARAMETER ACCESS FUNCTIONS
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION `layer_03_decisions.get_operational_parameter`(
+  param_category STRING,
+  param_name STRING,
+  param_scope STRING DEFAULT 'GLOBAL',
+  scope_value STRING DEFAULT NULL
+)
+RETURNS STRING
+AS (
+  (
+    SELECT parameter_value
+    FROM `layer_03_decisions.operational_parameters`
+    WHERE parameter_category = param_category
+      AND parameter_name = param_name
+      AND scope = param_scope
+      AND (scope_value IS NULL OR scope_value = scope_value)
+      AND is_active = TRUE
+      AND CURRENT_TIMESTAMP() BETWEEN effective_date AND COALESCE(expiry_date, TIMESTAMP '2099-12-31')
+    ORDER BY
+      CASE scope
+        WHEN 'CREATOR_SPECIFIC' THEN 1
+        WHEN 'CREATOR_TIER' THEN 2
+        WHEN 'GLOBAL' THEN 3
+      END
+    LIMIT 1
+  )
+);
+
+-- =====================================================================
+-- DECISION EVALUATION FUNCTION
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION `layer_03_decisions.evaluate_decision_rules`(
+  candidate_data JSON,
+  rule_category STRING DEFAULT 'ALL'
+)
+RETURNS JSON
+LANGUAGE js AS """
+  let result = {
+    decision: 'APPROVED',
+    applied_rules: [],
+    warnings: [],
+    modifications: [],
+    block_reasons: []
+  };
+
+  try {
+    const candidate = JSON.parse(candidate_data);
+
+    // Simulate rule evaluation (in production, this would query the decision_rules table)
+
+    // Rule 1: Quiet hours check
+    if (candidate.candidate_hour >= 2 && candidate.candidate_hour <= 7) {
+      result.decision = 'BLOCKED';
+      result.block_reasons.push('Quiet hours policy violation');
+      result.applied_rules.push('Quiet Hours Enforcement');
+      return JSON.stringify(result);
+    }
+
+    // Rule 2: Fatigue prevention
+    if (candidate.hours_since_last_send < 3 && candidate.creator_tier !== 'PREMIUM') {
+      result.decision = 'BLOCKED';
+      result.block_reasons.push('Fatigue prevention - too frequent sending');
+      result.applied_rules.push('Fatigue Prevention Block');
+      return JSON.stringify(result);
+    }
+
+    // Rule 3: Low performance review
+    if (candidate.slot_score < 0.5 && candidate.content_usage_count > 10) {
+      result.decision = 'REVIEW_REQUIRED';
+      result.warnings.push('Low performing content with high usage');
+      result.modifications.push('Suggest content alternatives');
+      result.applied_rules.push('Low Performance Content Review');
+    }
+
+    // Rule 4: High performance approval
+    if (candidate.slot_score >= 0.8 && candidate.confidence_score >= 0.7 && candidate.fatigue_level === 'NO_FATIGUE') {
+      result.decision = 'AUTO_APPROVED';
+      result.applied_rules.push('High Performance Content Approval');
+    }
+
+    // Rule 5: Premium optimization
+    if (candidate.creator_tier === 'PREMIUM' && candidate.primary_fan_segment === 'WHALES' && candidate.slot_score >= 0.6) {
+      result.modifications.push('Apply premium pricing optimization');
+      result.applied_rules.push('Premium Creator Optimization');
+    }
+
+  } catch (e) {
+    result.decision = 'ERROR';
+    result.block_reasons.push('Rule evaluation error: ' + e.message);
+  }
+
+  return JSON.stringify(result);
+""";
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L3', 'ops_config',
+  'SUCCESS',
+  'Created operational configuration with A/B testing framework and decision rules engine',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L3.01 COMPLETE' as status,
+  'Operations configuration created with A/B testing framework and intelligent decision rules' as message,
+  CURRENT_TIMESTAMP() as completed_at;

@@ -1,0 +1,558 @@
+config {
+  type: "view",
+  tags: ["L1", "v_caption_usage"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.05: Caption Usage Analytics - Smart Content Utilization
+-- =====================================================================
+-- Real-time caption usage tracking with intelligent rotation suggestions,
+-- fatigue prevention, and performance-based content recommendations.
+-- =====================================================================
+
+-- =====================================================================
+-- CAPTION USAGE TRACKING VIEW
+-- =====================================================================
+
+
+WITH usage_patterns AS (
+  -- Analyze recent caption usage patterns
+  SELECT
+    caption_hash,
+    creator_username,
+
+    -- Recent usage statistics
+    COUNT(*) AS total_uses,
+    COUNT(DISTINCT send_date) AS days_used,
+    MIN(send_date) AS first_use_date,
+    MAX(send_date) AS last_use_date,
+    DATE_DIFF(CURRENT_DATE(), MAX(send_date), DAY) AS days_since_last_use,
+
+    -- Usage frequency patterns
+    COUNT(*) / GREATEST(DATE_DIFF(MAX(send_date), MIN(send_date), DAY), 1) AS avg_uses_per_day,
+    COUNT(CASE WHEN send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN 1 END) AS uses_last_7d,
+    COUNT(CASE WHEN send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN 1 END) AS uses_last_30d,
+
+    -- Performance tracking
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement_score,
+    SUM(earnings) AS total_earnings,
+
+    -- Performance trend
+    CORR(UNIX_DATE(send_date), conversion_rate) AS conversion_trend_correlation,
+    CORR(UNIX_DATE(send_date), revenue_per_message) AS rpm_trend_correlation,
+
+    -- Content context
+    MAX(content_category) AS content_category,
+    MAX(char_length) AS char_length,
+    MAX(creator_tier) AS creator_tier,
+
+    -- Usage timing patterns
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+    APPROX_TOP_COUNT(send_hour, 1)[OFFSET(0)].value AS preferred_hour,
+    COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM send_date)) AS day_diversity,
+
+    -- Quality metrics
+    AVG(novelty_score) AS avg_novelty_score,
+    AVG(data_quality_score) AS avg_quality_score
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)  -- 6 months window
+    AND message_hash IS NOT NULL
+  GROUP BY caption_hash, creator_username
+),
+
+fatigue_analysis AS (
+  -- Analyze caption fatigue and diminishing returns
+  SELECT
+    up.*,
+
+    -- Fatigue indicators
+    CASE
+      WHEN uses_last_7d >= 3 AND avg_conversion_rate < 0.03 THEN 'HIGH_FATIGUE'
+      WHEN uses_last_7d >= 2 AND conversion_trend_correlation < -0.5 THEN 'MODERATE_FATIGUE'
+      WHEN uses_last_30d >= 8 AND avg_novelty_score < 0.3 THEN 'MILD_FATIGUE'
+      ELSE 'NO_FATIGUE'
+    END AS fatigue_level,
+
+    -- Usage intensity classification
+    CASE
+      WHEN uses_last_7d >= 4 THEN 'OVERUSED'
+      WHEN uses_last_7d >= 2 THEN 'HEAVILY_USED'
+      WHEN uses_last_7d = 1 THEN 'MODERATELY_USED'
+      WHEN uses_last_30d >= 1 THEN 'LIGHTLY_USED'
+      ELSE 'UNUSED'
+    END AS usage_intensity,
+
+    -- Performance trajectory
+    CASE
+      WHEN conversion_trend_correlation >= 0.5 THEN 'IMPROVING'
+      WHEN conversion_trend_correlation >= -0.2 THEN 'STABLE'
+      WHEN conversion_trend_correlation >= -0.5 THEN 'DECLINING'
+      ELSE 'POOR_TRAJECTORY'
+    END AS performance_trajectory,
+
+    -- Rest recommendation
+    CASE
+      WHEN uses_last_7d >= 3 AND conversion_trend_correlation < -0.3 THEN
+        GREATEST(7 - days_since_last_use, 0)
+      WHEN uses_last_7d >= 2 AND avg_conversion_rate < 0.02 THEN
+        GREATEST(3 - days_since_last_use, 0)
+      WHEN uses_last_30d >= 10 THEN
+        GREATEST(2 - days_since_last_use, 0)
+      ELSE 0
+    END AS recommended_rest_days,
+
+    -- Rotation priority
+    CASE
+      WHEN fatigue_level = 'HIGH_FATIGUE' THEN 1  -- Immediate rotation needed
+      WHEN fatigue_level = 'MODERATE_FATIGUE' THEN 2
+      WHEN fatigue_level = 'MILD_FATIGUE' THEN 3
+      WHEN uses_last_7d = 0 AND avg_rpm > 1.0 THEN 4  -- Good unused content
+      ELSE 5  -- No immediate action needed
+    END AS rotation_priority
+
+  FROM usage_patterns up
+),
+
+alternative_suggestions AS (
+  -- Find alternative captions with similar characteristics
+  SELECT
+    fa.*,
+
+    -- Find similar performing captions from same creator
+    ARRAY(
+      SELECT DISTINCT similar.caption_hash
+      FROM usage_patterns similar
+      WHERE similar.creator_username = fa.creator_username
+        AND similar.content_category = fa.content_category
+        AND similar.caption_hash != fa.caption_hash
+        AND similar.avg_rpm >= fa.avg_rpm * 0.8  -- At least 80% of current performance
+        AND similar.uses_last_7d = 0  -- Not recently used
+        AND ABS(similar.char_length - fa.char_length) <= 50  -- Similar length
+      ORDER BY similar.avg_rpm DESC
+      LIMIT 3
+    ) AS similar_alternatives,
+
+    -- Find high-performing captions from other creators in same tier
+    ARRAY(
+      SELECT DISTINCT other.caption_hash
+      FROM usage_patterns other
+      WHERE other.creator_tier = fa.creator_tier
+        AND other.content_category = fa.content_category
+        AND other.caption_hash != fa.caption_hash
+        AND other.creator_username != fa.creator_username
+        AND other.avg_rpm >= 1.5  -- High performance threshold
+        AND other.total_uses >= 5  -- Proven performance
+        AND ABS(other.char_length - fa.char_length) <= 30  -- Similar length
+      ORDER BY other.avg_rpm DESC
+      LIMIT 2
+    ) AS cross_creator_alternatives
+
+  FROM fatigue_analysis fa
+)
+
+-- Main view query
+SELECT
+  caption_hash,
+  creator_username,
+  content_category,
+  creator_tier,
+
+  -- Usage statistics
+  total_uses,
+  days_used,
+  first_use_date,
+  last_use_date,
+  days_since_last_use,
+  ROUND(avg_uses_per_day, 2) AS avg_uses_per_day,
+  uses_last_7d,
+  uses_last_30d,
+
+  -- Performance metrics
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+  ROUND(avg_engagement_score, 4) AS avg_engagement_score,
+  ROUND(total_earnings, 2) AS total_earnings,
+
+  -- Trend analysis
+  ROUND(conversion_trend_correlation, 3) AS conversion_trend_correlation,
+  ROUND(rpm_trend_correlation, 3) AS rpm_trend_correlation,
+  performance_trajectory,
+
+  -- Fatigue and intensity
+  fatigue_level,
+  usage_intensity,
+  rotation_priority,
+  recommended_rest_days,
+
+  -- Usage patterns
+  hour_diversity,
+  preferred_hour,
+  day_diversity,
+
+  -- Quality metrics
+  ROUND(avg_novelty_score, 3) AS avg_novelty_score,
+  ROUND(avg_quality_score, 3) AS avg_quality_score,
+
+  -- Recommendations
+  similar_alternatives,
+  cross_creator_alternatives,
+
+  -- Action recommendations
+  CASE
+    WHEN fatigue_level = 'HIGH_FATIGUE' THEN 'RETIRE_IMMEDIATELY'
+    WHEN fatigue_level = 'MODERATE_FATIGUE' AND recommended_rest_days > 0 THEN 'REST_REQUIRED'
+    WHEN usage_intensity = 'OVERUSED' THEN 'REDUCE_FREQUENCY'
+    WHEN usage_intensity = 'UNUSED' AND avg_rpm > 1.0 THEN 'CONSIDER_REUSING'
+    WHEN performance_trajectory = 'IMPROVING' THEN 'CONTINUE_MONITORING'
+    WHEN performance_trajectory = 'POOR_TRAJECTORY' THEN 'NEEDS_OPTIMIZATION'
+    ELSE 'MAINTAIN_CURRENT_USAGE'
+  END AS recommended_action,
+
+  -- Strategic insights
+  ARRAY_CONCAT(
+    CASE WHEN uses_last_7d >= 3 THEN ['HIGH_FREQUENCY'] ELSE [] END,
+    CASE WHEN conversion_trend_correlation < -0.5 THEN ['DECLINING_PERFORMANCE'] ELSE [] END,
+    CASE WHEN avg_novelty_score < 0.3 THEN ['LOW_NOVELTY'] ELSE [] END,
+    CASE WHEN ARRAY_LENGTH(similar_alternatives) = 0 THEN ['NO_ALTERNATIVES'] ELSE [] END,
+    CASE WHEN total_earnings > 500 THEN ['HIGH_EARNER'] ELSE [] END,
+    CASE WHEN avg_rpm > 2.0 THEN ['TOP_PERFORMER'] ELSE [] END
+  ) AS usage_insights,
+
+  -- Metadata
+  char_length,
+  CURRENT_TIMESTAMP() AS usage_analyzed_at
+
+FROM alternative_suggestions
+ORDER BY rotation_priority ASC, total_earnings DESC
+
+-- =====================================================================
+-- ROTATION SCHEDULER VIEW
+-- =====================================================================
+
+
+WITH rotation_candidates AS (
+  -- Identify captions needing rotation
+  SELECT
+    creator_username,
+    creator_tier,
+    content_category,
+
+    -- Captions to retire/rest
+    ARRAY_AGG(
+      CASE WHEN fatigue_level IN ('HIGH_FATIGUE', 'MODERATE_FATIGUE')
+           OR recommended_rest_days > 0
+           THEN STRUCT(
+             caption_hash,
+             fatigue_level,
+             recommended_rest_days,
+             uses_last_7d,
+             avg_rpm
+           )
+      END IGNORE NULLS
+    ) AS captions_to_rest,
+
+    -- High-performing unused captions
+    ARRAY_AGG(
+      CASE WHEN usage_intensity = 'UNUSED'
+           AND avg_rpm >= 1.0
+           AND days_since_last_use >= 7
+           THEN STRUCT(
+             caption_hash,
+             avg_rpm,
+             total_uses,
+             days_since_last_use,
+             avg_conversion_rate
+           )
+      END IGNORE NULLS
+    ) AS available_high_performers,
+
+    -- Currently active captions
+    ARRAY_AGG(
+      CASE WHEN uses_last_7d > 0
+           THEN STRUCT(
+             caption_hash,
+             uses_last_7d,
+             avg_rpm,
+             fatigue_level
+           )
+      END IGNORE NULLS
+    ) AS currently_active,
+
+    COUNT(CASE WHEN fatigue_level IN ('HIGH_FATIGUE', 'MODERATE_FATIGUE') THEN 1 END) AS fatigued_count,
+    COUNT(CASE WHEN uses_last_7d > 0 THEN 1 END) AS active_count,
+    COUNT(CASE WHEN usage_intensity = 'UNUSED' AND avg_rpm >= 1.0 THEN 1 END) AS available_alternatives
+
+  FROM `layer_01_semantic.v_caption_usage`
+  GROUP BY creator_username, creator_tier, content_category
+),
+
+rotation_recommendations AS (
+  -- Generate specific rotation recommendations
+  SELECT
+    creator_username,
+    creator_tier,
+    content_category,
+
+    fatigued_count,
+    active_count,
+    available_alternatives,
+
+    captions_to_rest,
+    available_high_performers,
+    currently_active,
+
+    -- Rotation urgency
+    CASE
+      WHEN fatigued_count >= 3 THEN 'URGENT'
+      WHEN fatigued_count >= 2 THEN 'HIGH'
+      WHEN fatigued_count >= 1 THEN 'MEDIUM'
+      WHEN active_count <= 2 AND available_alternatives >= 2 THEN 'OPPORTUNITY'
+      ELSE 'LOW'
+    END AS rotation_urgency,
+
+    -- Rotation strategy
+    CASE
+      WHEN fatigued_count > available_alternatives THEN 'INSUFFICIENT_ALTERNATIVES'
+      WHEN fatigued_count > 0 AND available_alternatives > 0 THEN 'DIRECT_SWAP'
+      WHEN active_count <= 3 AND available_alternatives >= 2 THEN 'EXPAND_ROTATION'
+      ELSE 'MAINTAIN_CURRENT'
+    END AS rotation_strategy,
+
+    -- Estimated impact
+    CASE
+      WHEN rotation_urgency = 'URGENT' THEN 'HIGH_POSITIVE_IMPACT'
+      WHEN rotation_urgency = 'HIGH' THEN 'MEDIUM_POSITIVE_IMPACT'
+      WHEN rotation_strategy = 'EXPAND_ROTATION' THEN 'POTENTIAL_GROWTH'
+      ELSE 'MINIMAL_IMPACT'
+    END AS expected_impact
+
+  FROM rotation_candidates
+  WHERE fatigued_count > 0 OR available_alternatives > 0  -- Only show actionable items
+)
+
+SELECT
+  creator_username,
+  creator_tier,
+  content_category,
+
+  -- Rotation metrics
+  fatigued_count,
+  active_count,
+  available_alternatives,
+
+  -- Strategy and urgency
+  rotation_urgency,
+  rotation_strategy,
+  expected_impact,
+
+  -- Specific recommendations
+  captions_to_rest,
+  available_high_performers,
+  currently_active,
+
+  -- Action plan
+  CASE
+    WHEN rotation_strategy = 'DIRECT_SWAP' THEN
+      FORMAT('Retire %d fatigued captions and replace with %d high-performers',
+             fatigued_count, LEAST(fatigued_count, available_alternatives))
+    WHEN rotation_strategy = 'EXPAND_ROTATION' THEN
+      FORMAT('Add %d high-performing captions to current rotation',
+             LEAST(available_alternatives, 3))
+    WHEN rotation_strategy = 'INSUFFICIENT_ALTERNATIVES' THEN
+      'Need to source new content - consider cross-creator sharing or AI generation'
+    ELSE 'No immediate action required'
+  END AS action_plan,
+
+  -- Priority score for scheduling
+  CASE
+    WHEN rotation_urgency = 'URGENT' THEN 100
+    WHEN rotation_urgency = 'HIGH' THEN 80
+    WHEN rotation_urgency = 'MEDIUM' THEN 60
+    WHEN rotation_urgency = 'OPPORTUNITY' THEN 40
+    ELSE 20
+  END AS priority_score,
+
+  CURRENT_TIMESTAMP() AS rotation_analyzed_at
+
+FROM rotation_recommendations
+ORDER BY priority_score DESC, fatigued_count DESC
+
+-- =====================================================================
+-- CONTENT GAP ANALYSIS VIEW
+-- =====================================================================
+
+
+WITH creator_content_inventory AS (
+  -- Analyze each creator's content portfolio
+  SELECT
+    creator_username,
+    creator_tier,
+
+    -- Content type coverage
+    COUNT(DISTINCT content_category) AS content_types_available,
+    COUNT(CASE WHEN content_category = 'PPV' THEN 1 END) AS ppv_captions,
+    COUNT(CASE WHEN content_category = 'BUMP' THEN 1 END) AS bump_captions,
+    COUNT(CASE WHEN content_category = 'TIP' THEN 1 END) AS tip_captions,
+    COUNT(CASE WHEN content_category = 'CUSTOM' THEN 1 END) AS custom_captions,
+
+    -- Performance distribution
+    COUNT(CASE WHEN avg_rpm >= 2.0 THEN 1 END) AS premium_performers,
+    COUNT(CASE WHEN avg_rpm >= 1.0 THEN 1 END) AS good_performers,
+    COUNT(CASE WHEN avg_rpm < 0.5 THEN 1 END) AS poor_performers,
+
+    -- Usage status
+    COUNT(CASE WHEN uses_last_30d > 0 THEN 1 END) AS active_captions,
+    COUNT(CASE WHEN usage_intensity = 'UNUSED' THEN 1 END) AS unused_captions,
+    COUNT(CASE WHEN fatigue_level IN ('HIGH_FATIGUE', 'MODERATE_FATIGUE') THEN 1 END) AS fatigued_captions,
+
+    -- Content variety
+    COUNT(CASE WHEN char_length <= 50 THEN 1 END) AS short_captions,
+    COUNT(CASE WHEN char_length BETWEEN 51 AND 150 THEN 1 END) AS medium_captions,
+    COUNT(CASE WHEN char_length > 150 THEN 1 END) AS long_captions,
+
+    COUNT(*) AS total_captions
+
+  FROM `layer_01_semantic.v_caption_usage`
+  GROUP BY creator_username, creator_tier
+),
+
+gap_analysis AS (
+  -- Identify specific content gaps
+  SELECT
+    *,
+
+    -- Content type gaps
+    ARRAY_CONCAT(
+      CASE WHEN ppv_captions < 5 THEN ['PPV_SHORTAGE'] ELSE [] END,
+      CASE WHEN bump_captions < 10 THEN ['BUMP_SHORTAGE'] ELSE [] END,
+      CASE WHEN tip_captions < 3 THEN ['TIP_SHORTAGE'] ELSE [] END,
+      CASE WHEN custom_captions = 0 AND creator_tier IN ('PREMIUM', 'HIGH') THEN ['NO_CUSTOM_CONTENT'] ELSE [] END
+    ) AS content_type_gaps,
+
+    -- Performance gaps
+    ARRAY_CONCAT(
+      CASE WHEN premium_performers = 0 THEN ['NO_PREMIUM_PERFORMERS'] ELSE [] END,
+      CASE WHEN good_performers < 3 THEN ['FEW_GOOD_PERFORMERS'] ELSE [] END,
+      CASE WHEN poor_performers / total_captions > 0.5 THEN ['TOO_MANY_POOR_PERFORMERS'] ELSE [] END
+    ) AS performance_gaps,
+
+    -- Variety gaps
+    ARRAY_CONCAT(
+      CASE WHEN short_captions = 0 THEN ['NO_SHORT_CONTENT'] ELSE [] END,
+      CASE WHEN medium_captions < 5 THEN ['LIMITED_MEDIUM_CONTENT'] ELSE [] END,
+      CASE WHEN long_captions = 0 AND creator_tier IN ('PREMIUM', 'HIGH') THEN ['NO_LONG_CONTENT'] ELSE [] END
+    ) AS variety_gaps,
+
+    -- Usage health gaps
+    ARRAY_CONCAT(
+      CASE WHEN active_captions < 5 THEN ['TOO_FEW_ACTIVE'] ELSE [] END,
+      CASE WHEN fatigued_captions / active_captions > 0.3 THEN ['HIGH_FATIGUE_RATE'] ELSE [] END,
+      CASE WHEN unused_captions / total_captions > 0.7 THEN ['TOO_MANY_UNUSED'] ELSE [] END
+    ) AS usage_gaps,
+
+    -- Overall content health score
+    GREATEST(0, LEAST(100,
+      (ppv_captions * 2) +
+      (bump_captions) +
+      (tip_captions * 3) +
+      (good_performers * 5) +
+      (active_captions * 2) -
+      (poor_performers * 2) -
+      (fatigued_captions * 3)
+    )) AS content_health_score
+
+  FROM creator_content_inventory
+)
+
+SELECT
+  creator_username,
+  creator_tier,
+
+  -- Portfolio summary
+  total_captions,
+  content_types_available,
+  content_health_score,
+
+  -- Content type breakdown
+  ppv_captions,
+  bump_captions,
+  tip_captions,
+  custom_captions,
+
+  -- Performance breakdown
+  premium_performers,
+  good_performers,
+  poor_performers,
+  ROUND(poor_performers / total_captions * 100, 1) AS poor_performer_pct,
+
+  -- Usage health
+  active_captions,
+  unused_captions,
+  fatigued_captions,
+  ROUND(active_captions / total_captions * 100, 1) AS active_caption_pct,
+
+  -- Content variety
+  short_captions,
+  medium_captions,
+  long_captions,
+
+  -- Gap identification
+  content_type_gaps,
+  performance_gaps,
+  variety_gaps,
+  usage_gaps,
+
+  -- Priority recommendations
+  CASE
+    WHEN content_health_score < 30 THEN 'CRITICAL_CONTENT_OVERHAUL'
+    WHEN content_health_score < 50 THEN 'MAJOR_CONTENT_IMPROVEMENT'
+    WHEN content_health_score < 70 THEN 'MODERATE_CONTENT_ENHANCEMENT'
+    WHEN ARRAY_LENGTH(content_type_gaps) > 0 THEN 'FILL_CONTENT_GAPS'
+    ELSE 'OPTIMIZE_EXISTING_CONTENT'
+  END AS priority_action,
+
+  -- Urgency level
+  CASE
+    WHEN fatigued_captions / active_captions > 0.5 THEN 'URGENT'
+    WHEN content_health_score < 40 THEN 'HIGH'
+    WHEN ARRAY_LENGTH(content_type_gaps) >= 2 THEN 'MEDIUM'
+    ELSE 'LOW'
+  END AS urgency_level,
+
+  CURRENT_TIMESTAMP() AS gap_analyzed_at
+
+FROM gap_analysis
+ORDER BY
+  CASE
+    WHEN urgency_level = 'URGENT' THEN 1
+    WHEN urgency_level = 'HIGH' THEN 2
+    WHEN urgency_level = 'MEDIUM' THEN 3
+    ELSE 4
+  END,
+  content_health_score ASC
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'caption_usage',
+  'SUCCESS',
+  'Created intelligent caption usage analytics with rotation scheduling and gap analysis',
+  CURRENT_TIMESTAMP()
+)
+
+-- Success message
+SELECT
+  'L1.05 COMPLETE' as status,
+  'Caption usage analytics created with smart rotation and content gap analysis' as message,
+  CURRENT_TIMESTAMP() as completed_at

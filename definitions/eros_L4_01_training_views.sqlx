@@ -1,0 +1,400 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L4", "training_views"],
+  dependencies: ["eros_L3_01_ops_config", "eros_L3_02_next24"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L4.01: ML Training Views for Vertex AI Integration
+-- ================================================================
+-- Creates training datasets for ML models with proper feature engineering
+-- Feeds into Vertex AI AutoML and custom model training
+-- ================================================================
+
+-- Training view for message performance prediction
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_training_message_performance` AS
+SELECT
+  -- Target variables (what we want to predict)
+  CASE
+    WHEN viewed > 0 THEN viewed / GREATEST(sent, 1)
+    ELSE 0
+  END AS view_rate,
+
+  CASE
+    WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1)
+    ELSE 0
+  END AS conversion_rate,
+
+  CASE
+    WHEN earnings > 0 THEN earnings / GREATEST(purchased, 1)
+    ELSE 0
+  END AS avg_revenue_per_purchase,
+
+  -- Temporal features
+  EXTRACT(HOUR FROM sending_time) AS send_hour,
+  EXTRACT(DAYOFWEEK FROM sending_time) AS send_dow,
+  EXTRACT(DAY FROM sending_time) AS send_day,
+  DATE_DIFF(CURRENT_DATE(), DATE(sending_time), DAY) AS days_ago,
+
+  -- Message content features
+  LENGTH(message) AS message_length,
+  ARRAY_LENGTH(SPLIT(message, ' ')) AS word_count,
+
+  -- Contains pricing info
+  CASE
+    WHEN REGEXP_CONTAINS(LOWER(message), r'\$[0-9]+') THEN 1
+    ELSE 0
+  END AS has_price_mention,
+
+  -- Contains urgency words
+  CASE
+    WHEN REGEXP_CONTAINS(LOWER(message), r'limited|exclusive|special|tonight|today|now') THEN 1
+    ELSE 0
+  END AS has_urgency,
+
+  -- Contains emoji
+  CASE
+    WHEN REGEXP_CONTAINS(message, r'[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F700}-\x{1F77F}\x{1F780}-\x{1F7FF}\x{1F800}-\x{1F8FF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}]') THEN 1
+    ELSE 0
+  END AS has_emoji,
+
+  -- Creator features
+  sender AS creator_name,
+
+  -- Historical performance features (rolling averages)
+  AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END)
+    OVER (
+      PARTITION BY sender
+      ORDER BY sending_time
+      ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+    ) AS creator_avg_view_rate_30d,
+
+  AVG(CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END)
+    OVER (
+      PARTITION BY sender
+      ORDER BY sending_time
+      ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+    ) AS creator_avg_conversion_rate_30d,
+
+  -- Message timing relative to creator's patterns
+  ABS(EXTRACT(HOUR FROM sending_time) -
+    AVG(EXTRACT(HOUR FROM sending_time))
+      OVER (
+        PARTITION BY sender
+        ORDER BY sending_time
+        ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+      )
+  ) AS hour_deviation_from_avg,
+
+  -- Price features
+  CASE
+    WHEN price IS NOT NULL AND SAFE_CAST(price AS FLOAT64) > 0
+    THEN SAFE_CAST(price AS FLOAT64)
+    ELSE NULL
+  END AS price_numeric,
+
+  -- Meta features for training
+  message_id,
+  sending_time AS event_timestamp,
+
+  -- Training data quality
+  CASE
+    WHEN sent > 0 AND viewed >= 0 AND purchased >= 0 AND earnings >= 0
+    THEN 1
+    ELSE 0
+  END AS is_complete_record
+
+FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+WHERE
+  -- Only use complete records for training
+  sent > 0
+  AND viewed >= 0
+  AND purchased >= 0
+  AND earnings >= 0
+  -- Focus on recent data for relevance
+  AND DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+  -- Remove outliers
+  AND sent <= 10000
+  AND viewed <= sent * 2  -- Sanity check
+  AND purchased <= viewed  -- Sanity check
+
+
+-- Training view for optimal timing prediction
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_training_optimal_timing` AS
+WITH hourly_performance AS (
+  SELECT
+    sender AS creator_name,
+    EXTRACT(HOUR FROM sending_time) AS send_hour,
+    EXTRACT(DAYOFWEEK FROM sending_time) AS send_dow,
+
+    -- Performance metrics by hour
+    AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) AS avg_view_rate,
+    AVG(CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END) AS avg_conversion_rate,
+    COUNT(*) AS message_count,
+
+    -- Revenue per message
+    AVG(earnings / GREATEST(sent, 1)) AS avg_revenue_per_message
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE
+    DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+    AND sent > 0
+  GROUP BY creator_name, send_hour, send_dow
+  HAVING message_count >= 3  -- Minimum statistical significance
+),
+
+creator_best_hours AS (
+  SELECT
+    creator_name,
+    send_dow,
+    send_hour,
+    avg_view_rate,
+    avg_conversion_rate,
+    avg_revenue_per_message,
+
+    -- Rank hours by performance for each creator/day
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_name, send_dow
+      ORDER BY avg_revenue_per_message DESC
+    ) AS revenue_rank,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_name, send_dow
+      ORDER BY avg_view_rate DESC
+    ) AS view_rate_rank,
+
+    -- Is this the best hour for this creator/day?
+    CASE
+      WHEN ROW_NUMBER() OVER (
+        PARTITION BY creator_name, send_dow
+        ORDER BY avg_revenue_per_message DESC
+      ) = 1 THEN 1
+      ELSE 0
+    END AS is_best_revenue_hour,
+
+    CASE
+      WHEN ROW_NUMBER() OVER (
+        PARTITION BY creator_name, send_dow
+        ORDER BY avg_view_rate DESC
+      ) = 1 THEN 1
+      ELSE 0
+    END AS is_best_view_hour
+
+  FROM hourly_performance
+)
+
+SELECT
+  creator_name,
+  send_hour,
+  send_dow,
+
+  -- Target variables
+  is_best_revenue_hour,
+  is_best_view_hour,
+
+  -- Performance metrics
+  avg_view_rate,
+  avg_conversion_rate,
+  avg_revenue_per_message,
+
+  -- Relative performance features
+  avg_revenue_per_message / NULLIF(
+    AVG(avg_revenue_per_message) OVER (PARTITION BY creator_name, send_dow), 0
+  ) AS revenue_ratio_vs_day_avg,
+
+  avg_view_rate / NULLIF(
+    AVG(avg_view_rate) OVER (PARTITION BY creator_name, send_dow), 0
+  ) AS view_rate_ratio_vs_day_avg,
+
+  -- Hour features for ML
+  COS(2 * 3.14159 * send_hour / 24) AS hour_cos,
+  SIN(2 * 3.14159 * send_hour / 24) AS hour_sin,
+
+  -- Day features
+  CASE send_dow
+    WHEN 1 THEN 1 ELSE 0 -- Sunday
+  END AS is_sunday,
+  CASE send_dow
+    WHEN 7 THEN 1 ELSE 0 -- Saturday
+  END AS is_saturday,
+  CASE
+    WHEN send_dow IN (2,3,4,5,6) THEN 1 ELSE 0 -- Weekday
+  END AS is_weekday
+
+FROM creator_best_hours
+
+
+-- Training view for content generation features
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_training_content_features` AS
+WITH content_analysis AS (
+  SELECT
+    message_id,
+    sender AS creator_name,
+    message,
+    sending_time,
+
+    -- Performance targets
+    CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END AS view_rate,
+    CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END AS conversion_rate,
+    earnings / GREATEST(sent, 1) AS revenue_per_message,
+
+    -- Content features for Gemini training
+    LENGTH(message) AS char_count,
+    ARRAY_LENGTH(SPLIT(message, ' ')) AS word_count,
+    ARRAY_LENGTH(SPLIT(message, '.')) AS sentence_count,
+
+    -- Emotional tone indicators
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'love|heart|miss|adore|sweet') THEN 1 ELSE 0 END AS has_affection,
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'hot|sexy|naughty|dirty|wild') THEN 1 ELSE 0 END AS has_seductive,
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'exclusive|special|vip|private|personal') THEN 1 ELSE 0 END AS has_exclusivity,
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'new|fresh|latest|just|today') THEN 1 ELSE 0 END AS has_novelty,
+
+    -- Call to action strength
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'check|look|see|watch|view') THEN 1 ELSE 0 END AS has_soft_cta,
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'buy|purchase|get|unlock|tip') THEN 1 ELSE 0 END AS has_hard_cta,
+
+    -- Question indicators
+    CASE WHEN REGEXP_CONTAINS(message, r'\?') THEN 1 ELSE 0 END AS has_question,
+
+    -- Personalization
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'you|your|babe|baby|hun|honey') THEN 1 ELSE 0 END AS has_personal_address,
+
+    -- Time references
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'tonight|today|now|soon|later') THEN 1 ELSE 0 END AS has_time_reference,
+
+    -- Message category based on content
+    CASE
+      WHEN REGEXP_CONTAINS(LOWER(message), r'tip|support|help') THEN 'TIP_REQUEST'
+      WHEN REGEXP_CONTAINS(LOWER(message), r'new|content|photo|video|post') THEN 'CONTENT_ANNOUNCEMENT'
+      WHEN REGEXP_CONTAINS(LOWER(message), r'sale|discount|special|offer') THEN 'PROMOTION'
+      WHEN REGEXP_CONTAINS(LOWER(message), r'personal|private|chat|talk') THEN 'PERSONAL_ENGAGEMENT'
+      ELSE 'GENERAL'
+    END AS content_category
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE
+    DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+    AND sent > 0
+    AND message IS NOT NULL
+    AND LENGTH(TRIM(message)) > 0
+),
+
+content_performance AS (
+  SELECT
+    *,
+
+    -- Performance quartiles for this creator
+    NTILE(4) OVER (
+      PARTITION BY creator_name
+      ORDER BY revenue_per_message
+    ) AS revenue_quartile,
+
+    NTILE(4) OVER (
+      PARTITION BY creator_name
+      ORDER BY view_rate
+    ) AS view_rate_quartile,
+
+    -- Content length analysis
+    CASE
+      WHEN char_count <= 50 THEN 'SHORT'
+      WHEN char_count <= 150 THEN 'MEDIUM'
+      ELSE 'LONG'
+    END AS length_category,
+
+    -- Feature density
+    (has_affection + has_seductive + has_exclusivity + has_novelty +
+     has_soft_cta + has_hard_cta + has_question + has_personal_address +
+     has_time_reference) AS total_feature_count
+
+  FROM content_analysis
+)
+
+SELECT
+  message_id,
+  creator_name,
+  message,
+  sending_time AS event_timestamp,
+
+  -- Targets for content generation ML
+  CASE WHEN revenue_quartile >= 3 THEN 1 ELSE 0 END AS is_high_revenue,
+  CASE WHEN view_rate_quartile >= 3 THEN 1 ELSE 0 END AS is_high_engagement,
+
+  -- Content features
+  char_count,
+  word_count,
+  sentence_count,
+  length_category,
+  content_category,
+  total_feature_count,
+
+  -- Individual features
+  has_affection,
+  has_seductive,
+  has_exclusivity,
+  has_novelty,
+  has_soft_cta,
+  has_hard_cta,
+  has_question,
+  has_personal_address,
+  has_time_reference,
+
+  -- Performance metrics
+  view_rate,
+  conversion_rate,
+  revenue_per_message,
+  revenue_quartile,
+  view_rate_quartile
+
+FROM content_performance
+WHERE revenue_per_message IS NOT NULL
+
+
+-- Export training data for Vertex AI AutoML
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_04_ml.sp_export_training_data`(
+  dataset_name STRING,
+  export_path STRING
+)
+BEGIN
+  -- Export message performance training data
+  EXPORT DATA
+    OPTIONS (
+      uri = CONCAT(export_path, '/message_performance_training_*.csv'),
+      format = 'CSV',
+      overwrite = true,
+      header = true
+    )
+  AS (
+    SELECT * EXCEPT(message_id, event_timestamp)
+    FROM `of-scheduler-proj.layer_04_ml.v_training_message_performance`
+    WHERE is_complete_record = 1
+  )
+
+  -- Export timing optimization training data
+  EXPORT DATA
+    OPTIONS (
+      uri = CONCAT(export_path, '/timing_optimization_training_*.csv'),
+      format = 'CSV',
+      overwrite = true,
+      header = true
+    )
+  AS (
+    SELECT * EXCEPT(creator_name)
+    FROM `of-scheduler-proj.layer_04_ml.v_training_optimal_timing`
+  )
+
+  -- Export content features training data
+  EXPORT DATA
+    OPTIONS (
+      uri = CONCAT(export_path, '/content_features_training_*.csv'),
+      format = 'CSV',
+      overwrite = true,
+      header = true
+    )
+  AS (
+    SELECT * EXCEPT(message_id, creator_name, message, event_timestamp)
+    FROM `of-scheduler-proj.layer_04_ml.v_training_content_features`
+  )
+
+END

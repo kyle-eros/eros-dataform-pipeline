@@ -1,0 +1,459 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L6", "alerts_now"],
+  dependencies: ["eros_L5_02_materialize_next24_active"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L6.03: Real-time Alert Detection and Processing
+-- ================================================================
+-- Active alert detection engine that evaluates alert rules
+-- Processes alert conditions and generates notifications
+-- ================================================================
+
+-- Current active alerts view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_06_monitoring.v_alerts_now` AS
+WITH system_alerts AS (
+  SELECT
+    'SYSTEM' AS alert_category,
+    s.metric_name AS alert_source,
+    s.metric_category || '_' || s.metric_name AS alert_key,
+    CASE s.metric_name
+      WHEN 'ml_recommendations_freshness' THEN 'ML recommendations are stale'
+      WHEN 'staging_data_freshness' THEN 'Data ingestion lag detected'
+      WHEN 'duplicate_messages_count' THEN 'Duplicate messages in system'
+      WHEN 'error_rate_last_hour' THEN 'High system error rate'
+      ELSE s.metric_name
+    END AS alert_title,
+    CONCAT(
+      s.metric_name, ' = ', s.metric_value, ' ', s.unit,
+      CASE s.metric_name
+        WHEN 'ml_recommendations_freshness' THEN ' (ML recommendations not updated)'
+        WHEN 'staging_data_freshness' THEN ' (No new data loaded)'
+        WHEN 'duplicate_messages_count' THEN ' (Duplicates found in ingestion)'
+        WHEN 'error_rate_last_hour' THEN ' (System errors in last hour)'
+        ELSE ''
+      END
+    ) AS alert_description,
+    s.alert_level AS severity,
+    s.metric_value,
+    s.unit,
+    s.measurement_time AS detected_at,
+    s.should_alert
+  FROM `of-scheduler-proj.layer_06_monitoring.v_system_health_metrics` s
+  WHERE s.should_alert = true
+),
+
+performance_alerts AS (
+  SELECT
+    'PERFORMANCE' AS alert_category,
+    p.creator_name AS alert_source,
+    p.creator_name || '_performance' AS alert_key,
+    CASE p.overall_alert_level
+      WHEN 'CRITICAL' THEN CONCAT('CRITICAL: ', p.creator_name, ' performance degraded')
+      WHEN 'HIGH' THEN CONCAT('HIGH: ', p.creator_name, ' needs attention')
+      ELSE CONCAT('WARNING: ', p.creator_name, ' performance issue')
+    END AS alert_title,
+    CONCAT(
+      'Creator performance issues: ',
+      CASE WHEN p.view_rate_alert_level IN ('HIGH', 'CRITICAL')
+           THEN CONCAT('View rate ', ROUND(p.view_rate_24h * 100, 1), '% ') ELSE '' END,
+      CASE WHEN p.conversion_alert_level IN ('HIGH', 'CRITICAL')
+           THEN CONCAT('Conversion rate ', ROUND(p.conversion_rate_24h * 100, 1), '% ') ELSE '' END,
+      CASE WHEN p.inactivity_alert_level = 'HIGH'
+           THEN CONCAT('Inactive for ', p.hours_since_last_message, 'h ') ELSE '' END,
+      CASE WHEN p.revenue_change_percent < -20
+           THEN CONCAT('Revenue down ', ABS(p.revenue_change_percent), '% ') ELSE '' END
+    ) AS alert_description,
+    p.overall_alert_level AS severity,
+    p.revenue_24h AS metric_value,
+    'USD' AS unit,
+    p.measurement_time AS detected_at,
+    p.should_alert
+  FROM `of-scheduler-proj.layer_06_monitoring.v_performance_metrics` p
+  WHERE p.should_alert = true
+),
+
+ml_drift_alerts AS (
+  SELECT
+    'ML_DRIFT' AS alert_category,
+    'ml_model_accuracy' AS alert_source,
+    CONCAT('ml_drift_', d.prediction_date) AS alert_key,
+    CASE d.overall_drift_level
+      WHEN 'CRITICAL' THEN 'CRITICAL: ML model accuracy severely degraded'
+      WHEN 'HIGH' THEN 'HIGH: ML model showing significant drift'
+      ELSE 'WARNING: ML model accuracy declining'
+    END AS alert_title,
+    CONCAT(
+      'ML model drift detected: ',
+      'View rate MAPE ', d.view_rate_mape_percent, '%, ',
+      'Conversion MAPE ', d.conversion_rate_mape_percent, '%, ',
+      'Trend: ', d.accuracy_trend
+    ) AS alert_description,
+    d.overall_drift_level AS severity,
+    d.view_rate_mape_percent AS metric_value,
+    'PERCENTAGE' AS unit,
+    d.measurement_time AS detected_at,
+    d.should_alert
+  FROM `of-scheduler-proj.layer_06_monitoring.v_ml_drift_detection` d
+  WHERE d.should_alert = true
+    AND d.prediction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+),
+
+business_alerts AS (
+  SELECT
+    'BUSINESS' AS alert_category,
+    'business_metrics' AS alert_source,
+    'business_health' AS alert_key,
+    CASE b.business_health_alert_level
+      WHEN 'CRITICAL' THEN 'CRITICAL: Business metrics showing severe decline'
+      WHEN 'HIGH' THEN 'HIGH: Business performance needs immediate attention'
+      ELSE 'WARNING: Business metrics declining'
+    END AS alert_title,
+    CONCAT(
+      'Business health issues: ',
+      CASE WHEN b.revenue_change_daily_percent < -10
+           THEN CONCAT('Daily revenue down ', ABS(b.revenue_change_daily_percent), '% ') ELSE '' END,
+      CASE WHEN b.message_volume_change_percent < -20
+           THEN CONCAT('Message volume down ', ABS(b.message_volume_change_percent), '% ') ELSE '' END,
+      'Active creators: ', b.active_creators_today, ' ',
+      'Revenue/msg: $', b.revenue_per_message_7d
+    ) AS alert_description,
+    b.business_health_alert_level AS severity,
+    b.revenue_today AS metric_value,
+    'USD' AS unit,
+    b.measurement_time AS detected_at,
+    b.should_alert
+  FROM `of-scheduler-proj.layer_06_monitoring.v_business_metrics` b
+  WHERE b.should_alert = true
+),
+
+all_alerts AS (
+  SELECT * FROM system_alerts
+  UNION ALL
+  SELECT * FROM performance_alerts
+  UNION ALL
+  SELECT * FROM ml_drift_alerts
+  UNION ALL
+  SELECT * FROM business_alerts
+),
+
+enriched_alerts AS (
+  SELECT
+    a.*,
+
+    -- Alert age
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), a.detected_at, MINUTE) AS alert_age_minutes,
+
+    -- Severity ranking for prioritization
+    CASE a.severity
+      WHEN 'CRITICAL' THEN 1
+      WHEN 'HIGH' THEN 2
+      WHEN 'MEDIUM' THEN 3
+      ELSE 4
+    END AS severity_rank,
+
+    -- Remediation suggestions
+    CASE a.alert_category
+      WHEN 'SYSTEM' THEN
+        CASE
+          WHEN a.alert_source = 'ml_recommendations_freshness'
+          THEN 'Run: CALL layer_04_ml.sp_refresh_next24_ml_recommendations()'
+          WHEN a.alert_source = 'staging_data_freshness'
+          THEN 'Check Gmail ETL pipeline and run data loads'
+          WHEN a.alert_source = 'duplicate_messages_count'
+          THEN 'Review deduplication logic and message_id generation'
+          WHEN a.alert_source = 'error_rate_last_hour'
+          THEN 'Check system_events table for error patterns'
+          ELSE 'Check system logs and run diagnostics'
+        END
+      WHEN 'PERFORMANCE' THEN
+        CONCAT('Review creator ', a.alert_source, ' performance and optimize scheduling')
+      WHEN 'ML_DRIFT' THEN
+        'Consider retraining ML models and validating feature engineering'
+      WHEN 'BUSINESS' THEN
+        'Analyze business trends and review operational strategies'
+      ELSE 'Investigate root cause and implement corrective measures'
+    END AS suggested_action,
+
+    -- Alert urgency
+    CASE
+      WHEN a.severity = 'CRITICAL' THEN 'IMMEDIATE'
+      WHEN a.severity = 'HIGH' AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), a.detected_at, MINUTE) > 30 THEN 'URGENT'
+      WHEN a.severity = 'HIGH' THEN 'HIGH_PRIORITY'
+      WHEN a.severity = 'MEDIUM' AND TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), a.detected_at, MINUTE) > 120 THEN 'ESCALATE'
+      ELSE 'STANDARD'
+    END AS urgency_level
+
+  FROM all_alerts a
+  WHERE a.should_alert = true
+)
+
+SELECT
+  alert_category,
+  alert_source,
+  alert_key,
+  alert_title,
+  alert_description,
+  severity,
+  urgency_level,
+  metric_value,
+  unit,
+  detected_at,
+  alert_age_minutes,
+  suggested_action,
+
+  -- Alert ID for tracking
+  TO_BASE64(SHA256(CONCAT(alert_key, '_', CAST(detected_at AS STRING)))) AS alert_id,
+
+  -- Status
+  'ACTIVE' AS alert_status,
+
+  -- Priority score for sorting
+  (severity_rank * 1000) + LEAST(alert_age_minutes, 999) AS priority_score
+
+FROM enriched_alerts
+ORDER BY priority_score ASC, detected_at DESC
+;
+
+-- Alert history and tracking
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_06_monitoring.alert_history` (
+  alert_id STRING NOT NULL,
+  alert_key STRING NOT NULL,
+  alert_category STRING NOT NULL,
+  alert_source STRING NOT NULL,
+  alert_title STRING NOT NULL,
+  alert_description STRING,
+  severity STRING NOT NULL,
+  urgency_level STRING,
+  metric_value FLOAT64,
+  unit STRING,
+  detected_at TIMESTAMP NOT NULL,
+  resolved_at TIMESTAMP,
+  alert_status STRING DEFAULT 'ACTIVE',
+  resolution_notes STRING,
+  resolved_by STRING,
+  auto_resolved BOOL DEFAULT false,
+  notification_sent BOOL DEFAULT false,
+  escalation_level INT64 DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+PARTITION BY DATE(detected_at)
+CLUSTER BY (alert_category, severity, alert_status)
+;
+
+-- Procedure to persist active alerts
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_06_monitoring.sp_process_active_alerts`()
+BEGIN
+
+  -- Insert new alerts that haven't been seen before
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.alert_history` (
+    alert_id,
+    alert_key,
+    alert_category,
+    alert_source,
+    alert_title,
+    alert_description,
+    severity,
+    urgency_level,
+    metric_value,
+    unit,
+    detected_at
+  )
+  SELECT
+    a.alert_id,
+    a.alert_key,
+    a.alert_category,
+    a.alert_source,
+    a.alert_title,
+    a.alert_description,
+    a.severity,
+    a.urgency_level,
+    a.metric_value,
+    a.unit,
+    a.detected_at
+  FROM `of-scheduler-proj.layer_06_monitoring.v_alerts_now` a
+  LEFT JOIN `of-scheduler-proj.layer_06_monitoring.alert_history` h
+    ON a.alert_key = h.alert_key
+    AND h.alert_status = 'ACTIVE'
+    AND DATE(a.detected_at) = DATE(h.detected_at)
+  WHERE h.alert_key IS NULL;
+
+  -- Auto-resolve alerts that are no longer active
+  UPDATE `of-scheduler-proj.layer_06_monitoring.alert_history`
+  SET
+    alert_status = 'AUTO_RESOLVED',
+    resolved_at = CURRENT_TIMESTAMP(),
+    auto_resolved = true,
+    resolution_notes = 'Alert condition no longer detected'
+  WHERE alert_status = 'ACTIVE'
+    AND alert_key NOT IN (
+      SELECT DISTINCT alert_key
+      FROM `of-scheduler-proj.layer_06_monitoring.v_alerts_now`
+    )
+    AND detected_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 10 MINUTE);
+
+  -- Log processing run
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'ALERT_PROCESSING',
+    'layer_06_monitoring',
+    'Alert processing completed',
+    TO_JSON_STRING(STRUCT(
+      (SELECT COUNT(*) FROM `of-scheduler-proj.layer_06_monitoring.v_alerts_now`) AS active_alerts,
+      (SELECT COUNT(*) FROM `of-scheduler-proj.layer_06_monitoring.alert_history` WHERE alert_status = 'ACTIVE') AS total_active_in_history
+    ))
+  );
+
+END;
+
+-- Alert summary dashboard view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_06_monitoring.v_alert_dashboard` AS
+WITH alert_summary AS (
+  SELECT
+    alert_category,
+    severity,
+    COUNT(*) AS alert_count,
+    MIN(detected_at) AS oldest_alert,
+    MAX(detected_at) AS newest_alert,
+    STRING_AGG(DISTINCT alert_source ORDER BY alert_source LIMIT 5) AS top_sources
+  FROM `of-scheduler-proj.layer_06_monitoring.v_alerts_now`
+  GROUP BY alert_category, severity
+),
+
+recent_history AS (
+  SELECT
+    alert_category,
+    COUNT(*) AS alerts_last_24h,
+    COUNTIF(alert_status = 'RESOLVED') AS resolved_last_24h,
+    COUNTIF(alert_status = 'AUTO_RESOLVED') AS auto_resolved_last_24h,
+    AVG(TIMESTAMP_DIFF(COALESCE(resolved_at, CURRENT_TIMESTAMP()), detected_at, MINUTE)) AS avg_resolution_time_minutes
+  FROM `of-scheduler-proj.layer_06_monitoring.alert_history`
+  WHERE detected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+  GROUP BY alert_category
+),
+
+system_status AS (
+  SELECT
+    COUNTIF(severity = 'CRITICAL') AS critical_alerts,
+    COUNTIF(severity = 'HIGH') AS high_alerts,
+    COUNTIF(severity = 'MEDIUM') AS medium_alerts,
+    COUNTIF(urgency_level = 'IMMEDIATE') AS immediate_alerts,
+    COUNT(*) AS total_active_alerts
+  FROM `of-scheduler-proj.layer_06_monitoring.v_alerts_now`
+)
+
+SELECT
+  CURRENT_TIMESTAMP() AS dashboard_timestamp,
+
+  -- Current alert counts by category and severity
+  (SELECT total_active_alerts FROM system_status) AS total_active_alerts,
+  (SELECT critical_alerts FROM system_status) AS critical_alerts,
+  (SELECT high_alerts FROM system_status) AS high_alerts,
+  (SELECT medium_alerts FROM system_status) AS medium_alerts,
+  (SELECT immediate_alerts FROM system_status) AS immediate_alerts,
+
+  -- Alert breakdown by category
+  ARRAY(
+    SELECT AS STRUCT
+      alert_category,
+      severity,
+      alert_count,
+      oldest_alert,
+      top_sources
+    FROM alert_summary
+    ORDER BY
+      CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 ELSE 4 END,
+      alert_count DESC
+  ) AS alert_breakdown,
+
+  -- Recent history summary
+  ARRAY(
+    SELECT AS STRUCT
+      alert_category,
+      alerts_last_24h,
+      resolved_last_24h,
+      auto_resolved_last_24h,
+      ROUND(avg_resolution_time_minutes, 1) AS avg_resolution_time_minutes
+    FROM recent_history
+    ORDER BY alerts_last_24h DESC
+  ) AS recent_history,
+
+  -- System health status
+  CASE
+    WHEN (SELECT critical_alerts FROM system_status) > 0 THEN '🔴 CRITICAL ISSUES DETECTED'
+    WHEN (SELECT high_alerts FROM system_status) > 5 THEN '🟠 MULTIPLE HIGH PRIORITY ALERTS'
+    WHEN (SELECT high_alerts FROM system_status) > 0 THEN '🟡 HIGH PRIORITY ALERTS ACTIVE'
+    WHEN (SELECT total_active_alerts FROM system_status) > 0 THEN '🟢 MINOR ALERTS ONLY'
+    ELSE '✅ ALL SYSTEMS HEALTHY'
+  END AS overall_status,
+
+  -- Next recommended actions
+  CASE
+    WHEN (SELECT critical_alerts FROM system_status) > 0 THEN 'Address critical alerts immediately'
+    WHEN (SELECT immediate_alerts FROM system_status) > 0 THEN 'Process immediate priority alerts'
+    WHEN (SELECT high_alerts FROM system_status) > 0 THEN 'Review high priority alerts'
+    ELSE 'Monitor and maintain current status'
+  END AS recommended_action
+;
+
+-- Notification routing view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_06_monitoring.v_alert_notifications` AS
+SELECT
+  alert_id,
+  alert_key,
+  alert_category,
+  severity,
+  urgency_level,
+  alert_title,
+  alert_description,
+  suggested_action,
+  detected_at,
+  alert_age_minutes,
+
+  -- Notification routing logic
+  CASE alert_category
+    WHEN 'SYSTEM' THEN ['engineering@company.com', 'ops@company.com']
+    WHEN 'BUSINESS' THEN ['management@company.com', 'analytics@company.com']
+    WHEN 'PERFORMANCE' THEN ['schedulers@company.com', 'ops@company.com']
+    WHEN 'ML_DRIFT' THEN ['ml-team@company.com', 'engineering@company.com']
+    ELSE ['ops@company.com']
+  END AS notification_recipients,
+
+  -- Notification method based on severity
+  CASE severity
+    WHEN 'CRITICAL' THEN ['EMAIL', 'SLACK', 'SMS']
+    WHEN 'HIGH' THEN ['EMAIL', 'SLACK']
+    WHEN 'MEDIUM' THEN ['EMAIL']
+    ELSE ['EMAIL']
+  END AS notification_methods,
+
+  -- Escalation timeline
+  CASE severity
+    WHEN 'CRITICAL' THEN 5  -- Escalate if not acknowledged in 5 minutes
+    WHEN 'HIGH' THEN 30     -- Escalate if not acknowledged in 30 minutes
+    WHEN 'MEDIUM' THEN 120  -- Escalate if not acknowledged in 2 hours
+    ELSE 480                -- Escalate if not acknowledged in 8 hours
+  END AS escalation_timeout_minutes,
+
+  -- Should send notification now
+  CASE
+    WHEN urgency_level = 'IMMEDIATE' THEN true
+    WHEN severity = 'CRITICAL' THEN true
+    WHEN severity = 'HIGH' AND alert_age_minutes >= 15 THEN true
+    WHEN severity = 'MEDIUM' AND alert_age_minutes >= 60 THEN true
+    ELSE false
+  END AS should_notify_now
+
+FROM `of-scheduler-proj.layer_06_monitoring.v_alerts_now`
+WHERE alert_age_minutes <= 480  -- Only notify on alerts less than 8 hours old
+ORDER BY priority_score ASC
+;

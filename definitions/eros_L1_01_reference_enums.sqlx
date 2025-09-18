@@ -1,0 +1,645 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L1", "reference_enums"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.01: Reference Enums - Business Logic Foundation
+-- =====================================================================
+-- Creates reference data and lookup tables for intelligent classification
+-- and business rule enforcement across the EROS scheduling system.
+-- =====================================================================
+
+-- =====================================================================
+-- CREATOR TIER DEFINITIONS
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_01_semantic.creator_tier_definitions` (
+  tier_name STRING NOT NULL,
+  tier_order INT64 NOT NULL,
+  min_rpm NUMERIC,
+  min_conversion_rate NUMERIC,
+  min_total_earnings NUMERIC,
+  min_days_active INT64,
+
+  -- Scheduling constraints
+  max_sends_per_day INT64,
+  min_hours_between_sends NUMERIC,
+  priority_score INT64,
+
+  -- Content guidelines
+  recommended_content_types ARRAY<STRING>,
+  optimal_message_length_min INT64,
+  optimal_message_length_max INT64,
+  requires_approval BOOL,
+
+  -- Performance thresholds
+  warning_rpm_threshold NUMERIC,
+  critical_rpm_threshold NUMERIC,
+  churn_risk_threshold NUMERIC,
+
+  -- Business rules
+  eligible_for_premium_pricing BOOL,
+  auto_optimization_enabled BOOL,
+  ml_recommendation_weight NUMERIC,
+
+  description STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY tier_order
+OPTIONS (
+  description = "Creator tier definitions with business rules and constraints"
+);
+
+-- Insert tier definitions
+INSERT INTO `layer_01_semantic.creator_tier_definitions` VALUES
+(
+  'PREMIUM',
+  1,
+  2.00,    -- min_rpm
+  0.08,    -- min_conversion_rate
+  5000.0,  -- min_total_earnings
+  30,      -- min_days_active
+  8,       -- max_sends_per_day
+  2.0,     -- min_hours_between_sends
+  100,     -- priority_score
+  ['PPV', 'CUSTOM', 'BUMP'],  -- recommended_content_types
+  80,      -- optimal_message_length_min
+  300,     -- optimal_message_length_max
+  FALSE,   -- requires_approval
+  1.50,    -- warning_rpm_threshold
+  1.00,    -- critical_rpm_threshold
+  0.05,    -- churn_risk_threshold
+  TRUE,    -- eligible_for_premium_pricing
+  TRUE,    -- auto_optimization_enabled
+  1.0,     -- ml_recommendation_weight
+  'Top-performing creators with highest revenue and conversion rates',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+),
+(
+  'HIGH',
+  2,
+  1.25,
+  0.06,
+  2500.0,
+  21,
+  6,
+  3.0,
+  80,
+  ['PPV', 'BUMP', 'TIP'],
+  60,
+  250,
+  FALSE,
+  1.00,
+  0.75,
+  0.08,
+  TRUE,
+  TRUE,
+  0.9,
+  'High-performing creators with strong metrics and consistency',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+),
+(
+  'MED',
+  3,
+  0.75,
+  0.04,
+  1000.0,
+  14,
+  5,
+  4.0,
+  60,
+  ['PPV', 'BUMP'],
+  40,
+  200,
+  FALSE,
+  0.60,
+  0.40,
+  0.12,
+  FALSE,
+  TRUE,
+  0.8,
+  'Medium-performing creators with growth potential',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+),
+(
+  'LOW',
+  4,
+  0.25,
+  0.02,
+  500.0,
+  7,
+  4,
+  6.0,
+  40,
+  ['BUMP', 'TIP'],
+  30,
+  150,
+  TRUE,
+  0.20,
+  0.15,
+  0.20,
+  FALSE,
+  FALSE,
+  0.6,
+  'Lower-performing creators requiring optimization',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+),
+(
+  'NEW',
+  5,
+  0.00,
+  0.00,
+  0.0,
+  0,
+  3,
+  8.0,
+  20,
+  ['BUMP'],
+  20,
+  100,
+  TRUE,
+  0.10,
+  0.05,
+  0.30,
+  FALSE,
+  FALSE,
+  0.4,
+  'New creators in onboarding phase',
+  CURRENT_TIMESTAMP(),
+  CURRENT_TIMESTAMP()
+);
+
+-- =====================================================================
+-- CONTENT TYPE CLASSIFICATIONS
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_01_semantic.content_type_definitions` (
+  content_type STRING NOT NULL,
+  category STRING NOT NULL,  -- PPV, ENGAGEMENT, RETENTION, PROMOTIONAL
+  priority_score INT64,
+
+  -- Performance expectations
+  expected_conversion_rate_min NUMERIC,
+  expected_conversion_rate_max NUMERIC,
+  expected_rpm_min NUMERIC,
+  expected_rpm_max NUMERIC,
+
+  -- Content characteristics
+  typical_message_length_min INT64,
+  typical_message_length_max INT64,
+  requires_pricing BOOL,
+  supports_personalization BOOL,
+
+  -- Frequency constraints
+  max_daily_usage INT64,
+  min_hours_between_same_type NUMERIC,
+  seasonal_boost_factor NUMERIC,
+
+  -- A/B testing eligibility
+  eligible_for_testing BOOL,
+  test_variants ARRAY<STRING>,
+
+  description STRING,
+  examples ARRAY<STRING>,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY category, priority_score
+OPTIONS (
+  description = "Content type definitions with performance expectations"
+);
+
+-- Insert content type definitions
+INSERT INTO `layer_01_semantic.content_type_definitions` VALUES
+(
+  'PPV',
+  'REVENUE',
+  100,
+  0.05, 0.15,  -- conversion rate range
+  1.00, 5.00,  -- rpm range
+  50, 200,     -- message length
+  TRUE,        -- requires_pricing
+  TRUE,        -- supports_personalization
+  6,           -- max_daily_usage
+  4.0,         -- min_hours_between
+  1.0,         -- seasonal_boost_factor
+  TRUE,        -- eligible_for_testing
+  ['PRICE_TEST', 'TIMING_TEST', 'CONTENT_TEST'],
+  'Pay-per-view content messages designed to drive immediate purchases',
+  ['🔥 New exclusive content just for you! Check it out for $10 💕', 'Hey babe! Just posted something special that I think you\'ll love 😘 $15'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'BUMP',
+  'ENGAGEMENT',
+  80,
+  0.02, 0.08,
+  0.30, 2.00,
+  30, 150,
+  FALSE,
+  TRUE,
+  8,
+  3.0,
+  1.2,
+  TRUE,
+  ['TIMING_TEST', 'CONTENT_TEST'],
+  'Engagement messages to maintain visibility and connection',
+  ['Good morning baby! ☀️ How are you doing today?', 'Thinking about you 💭 What are you up to? 😊'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'TIP',
+  'RETENTION',
+  90,
+  0.03, 0.12,
+  0.50, 3.00,
+  40, 180,
+  FALSE,
+  TRUE,
+  4,
+  6.0,
+  1.0,
+  TRUE,
+  ['CONTENT_TEST', 'FREQUENCY_TEST'],
+  'Tip request messages for additional revenue',
+  ['Would you spoil me a little today? 🥺💕', 'Feeling like treating your favorite girl? 😘'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'RENEW',
+  'RETENTION',
+  95,
+  0.08, 0.25,
+  2.00, 8.00,
+  60, 250,
+  FALSE,
+  FALSE,
+  2,
+  12.0,
+  1.5,
+  FALSE,
+  [],
+  'Subscription renewal reminders',
+  ['Your subscription expires soon! Don\'t miss out on exclusive content 💕'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'CUSTOM',
+  'PERSONALIZED',
+  70,
+  0.04, 0.20,
+  0.75, 4.00,
+  20, 300,
+  FALSE,
+  TRUE,
+  10,
+  1.0,
+  1.0,
+  TRUE,
+  ['PERSONALIZATION_TEST', 'CONTENT_TEST'],
+  'Custom personalized messages',
+  ['[Highly personalized content based on fan preferences]'],
+  CURRENT_TIMESTAMP()
+);
+
+-- =====================================================================
+-- FAN SEGMENTATION TYPES
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_01_semantic.fan_segment_definitions` (
+  segment_name STRING NOT NULL,
+  segment_category STRING NOT NULL,  -- VALUE, BEHAVIOR, TIMING, ENGAGEMENT
+  priority_score INT64,
+
+  -- Identification criteria
+  min_total_spent NUMERIC,
+  max_total_spent NUMERIC,
+  min_purchases INT64,
+  max_purchases INT64,
+  min_days_active INT64,
+  max_days_inactive INT64,
+
+  -- Behavioral patterns
+  preferred_content_types ARRAY<STRING>,
+  active_hours_start INT64,
+  active_hours_end INT64,
+  response_time_category STRING,  -- FAST, MEDIUM, SLOW
+
+  -- Targeting strategies
+  optimal_send_frequency NUMERIC,  -- per day
+  price_sensitivity STRING,  -- LOW, MEDIUM, HIGH
+  content_preferences ARRAY<STRING>,
+
+  -- Revenue potential
+  average_purchase_amount NUMERIC,
+  lifetime_value_tier STRING,  -- HIGH, MEDIUM, LOW
+  churn_risk_level STRING,     -- LOW, MEDIUM, HIGH
+
+  description STRING,
+  targeting_tips ARRAY<STRING>,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY segment_category, priority_score
+OPTIONS (
+  description = "Fan segmentation definitions for targeted messaging"
+);
+
+-- Insert fan segment definitions
+INSERT INTO `layer_01_semantic.fan_segment_definitions` VALUES
+(
+  'WHALES',
+  'VALUE',
+  100,
+  100.0, NULL,    -- min/max spent
+  10, NULL,       -- min/max purchases
+  30, 7,          -- min active days, max inactive days
+  ['PPV', 'CUSTOM', 'TIP'],
+  10, 24,         -- active hours (10 AM to 12 AM)
+  'FAST',         -- response time
+  2.0,            -- optimal sends per day
+  'LOW',          -- price sensitivity
+  ['EXCLUSIVE', 'PREMIUM', 'PERSONALIZED'],
+  25.0,           -- average purchase
+  'HIGH',         -- LTV tier
+  'LOW',          -- churn risk
+  'High-value fans who spend $100+ and purchase frequently',
+  ['Send premium content', 'Use personalized messages', 'Price aggressively', 'Maintain regular contact'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'NIGHT_OWLS',
+  'TIMING',
+  80,
+  20.0, 200.0,
+  3, 50,
+  14, 14,
+  ['PPV', 'BUMP'],
+  22, 6,          -- active hours (10 PM to 6 AM)
+  'MEDIUM',
+  1.5,
+  'MEDIUM',
+  ['LATE_NIGHT', 'INTIMATE'],
+  15.0,
+  'MEDIUM',
+  'MEDIUM',
+  'Fans most active during late night/early morning hours',
+  ['Send between 10 PM - 2 AM', 'Use intimate messaging', 'Consider timezone differences'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'TEASERS',
+  'BEHAVIOR',
+  60,
+  5.0, 50.0,
+  1, 10,
+  7, 21,
+  ['BUMP', 'TIP'],
+  12, 22,
+  'SLOW',
+  0.8,
+  'HIGH',
+  ['TEASING', 'PREVIEW'],
+  8.0,
+  'LOW',
+  'HIGH',
+  'Fans who engage but rarely purchase, price-sensitive',
+  ['Use teaser content', 'Lower price points', 'Build engagement first', 'Patient nurturing'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'LOYALISTS',
+  'ENGAGEMENT',
+  90,
+  50.0, NULL,
+  5, NULL,
+  60, 3,
+  ['PPV', 'CUSTOM', 'BUMP', 'TIP'],
+  8, 23,
+  'FAST',
+  1.8,
+  'LOW',
+  ['CONSISTENT', 'VARIETY'],
+  18.0,
+  'HIGH',
+  'LOW',
+  'Long-term fans with consistent engagement and purchases',
+  ['Maintain variety', 'Reward loyalty', 'Consistent schedule', 'Exclusive access'],
+  CURRENT_TIMESTAMP()
+),
+(
+  'BROWSERS',
+  'BEHAVIOR',
+  40,
+  0.0, 20.0,
+  0, 3,
+  3, 30,
+  ['BUMP'],
+  15, 21,
+  'SLOW',
+  0.5,
+  'HIGH',
+  ['FREE', 'PREVIEW'],
+  5.0,
+  'LOW',
+  'HIGH',
+  'Window shoppers who view but rarely purchase',
+  ['Focus on free content', 'Build trust slowly', 'Use social proof', 'Convert with special offers'],
+  CURRENT_TIMESTAMP()
+);
+
+-- =====================================================================
+-- TIME ZONE MAPPING
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_01_semantic.timezone_mappings` (
+  creator_username STRING NOT NULL,
+  timezone_name STRING NOT NULL,
+  utc_offset_hours NUMERIC NOT NULL,
+
+  -- Peak activity windows (in creator's local time)
+  peak_morning_start INT64,  -- Hour 0-23
+  peak_morning_end INT64,
+  peak_evening_start INT64,
+  peak_evening_end INT64,
+
+  -- Quiet hours (when not to send)
+  quiet_hours_start INT64,
+  quiet_hours_end INT64,
+
+  -- Day-of-week preferences
+  strong_weekdays ARRAY<INT64>,  -- 1=Sunday, 7=Saturday
+  weak_weekdays ARRAY<INT64>,
+
+  last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY creator_username
+OPTIONS (
+  description = "Creator timezone mapping for optimal send timing"
+);
+
+-- =====================================================================
+-- PRICE BAND DEFINITIONS
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_01_semantic.price_band_definitions` (
+  creator_tier STRING NOT NULL,
+  content_type STRING NOT NULL,
+  price_band STRING NOT NULL,  -- LOW, MED, HIGH, PREMIUM
+
+  min_price NUMERIC,
+  max_price NUMERIC,
+  recommended_price NUMERIC,
+
+  -- Performance expectations
+  expected_conversion_rate NUMERIC,
+  expected_volume_multiplier NUMERIC,  -- vs baseline
+
+  -- Usage constraints
+  max_daily_usage INT64,
+  optimal_timing_hours ARRAY<INT64>,
+
+  -- A/B testing parameters
+  test_price_variance_pct NUMERIC,  -- +/- percentage for testing
+
+  description STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY creator_tier, content_type
+OPTIONS (
+  description = "Dynamic pricing bands by creator tier and content type"
+);
+
+-- Insert price band definitions
+INSERT INTO `layer_01_semantic.price_band_definitions` VALUES
+-- PREMIUM creator bands
+('PREMIUM', 'PPV', 'LOW', 8.0, 12.0, 10.0, 0.12, 1.2, 4, [11,12,13,19,20,21], 0.20, 'Conservative pricing for premium creators'),
+('PREMIUM', 'PPV', 'MED', 12.0, 18.0, 15.0, 0.10, 1.0, 6, [11,12,13,19,20,21], 0.15, 'Standard pricing for premium creators'),
+('PREMIUM', 'PPV', 'HIGH', 18.0, 25.0, 22.0, 0.08, 0.8, 4, [19,20,21], 0.15, 'Premium pricing for exclusive content'),
+('PREMIUM', 'PPV', 'PREMIUM', 25.0, 50.0, 35.0, 0.05, 0.6, 2, [20,21], 0.20, 'Ultra-premium pricing for special content'),
+
+-- HIGH creator bands
+('HIGH', 'PPV', 'LOW', 5.0, 8.0, 6.0, 0.10, 1.3, 4, [11,12,13,19,20,21], 0.25, 'Conservative pricing for high-tier creators'),
+('HIGH', 'PPV', 'MED', 8.0, 12.0, 10.0, 0.08, 1.0, 6, [11,12,13,19,20,21], 0.20, 'Standard pricing for high-tier creators'),
+('HIGH', 'PPV', 'HIGH', 12.0, 18.0, 15.0, 0.06, 0.8, 4, [19,20,21], 0.20, 'Premium pricing for high-tier creators'),
+
+-- MED creator bands
+('MED', 'PPV', 'LOW', 3.0, 5.0, 4.0, 0.08, 1.4, 5, [11,12,13,19,20,21], 0.30, 'Conservative pricing for medium creators'),
+('MED', 'PPV', 'MED', 5.0, 8.0, 6.0, 0.06, 1.0, 6, [11,12,13,19,20,21], 0.25, 'Standard pricing for medium creators'),
+('MED', 'PPV', 'HIGH', 8.0, 12.0, 10.0, 0.04, 0.7, 3, [19,20,21], 0.25, 'Stretch pricing for medium creators'),
+
+-- LOW creator bands
+('LOW', 'PPV', 'LOW', 2.0, 3.0, 2.5, 0.06, 1.5, 4, [12,13,19,20], 0.40, 'Safe pricing for low-tier creators'),
+('LOW', 'PPV', 'MED', 3.0, 5.0, 4.0, 0.04, 1.0, 4, [12,13,19,20], 0.35, 'Stretch pricing for low-tier creators'),
+
+-- NEW creator bands
+('NEW', 'PPV', 'LOW', 1.0, 2.0, 1.5, 0.04, 1.2, 3, [12,13,20], 0.50, 'Introductory pricing for new creators');
+
+-- =====================================================================
+-- BUSINESS RULES ENGINE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_01_semantic.business_rules` (
+  rule_id STRING DEFAULT GENERATE_UUID(),
+  rule_name STRING NOT NULL,
+  rule_category STRING NOT NULL,  -- TIMING, PRICING, CONTENT, FREQUENCY
+
+  -- Conditions (JSON)
+  conditions JSON,
+
+  -- Actions (JSON)
+  actions JSON,
+
+  -- Metadata
+  priority INT64,
+  is_active BOOL DEFAULT TRUE,
+  creator_tiers ARRAY<STRING>,  -- Which tiers this applies to
+  content_types ARRAY<STRING>,  -- Which content types this applies to
+
+  -- Performance tracking
+  times_triggered INT64 DEFAULT 0,
+  success_rate NUMERIC,
+
+  created_by STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY rule_category, priority
+OPTIONS (
+  description = "Business rules engine for automated decision making"
+);
+
+-- Insert core business rules
+INSERT INTO `layer_01_semantic.business_rules` (
+  rule_name, rule_category, conditions, actions, priority,
+  creator_tiers, content_types, created_by
+) VALUES
+(
+  'Peak Hour Bonus',
+  'TIMING',
+  JSON '{"send_hour": {"between": [19, 22]}, "fan_segment": {"in": ["WHALES", "LOYALISTS"]}}',
+  JSON '{"score_multiplier": 1.2, "priority_boost": 10}',
+  100,
+  ['PREMIUM', 'HIGH'],
+  ['PPV', 'CUSTOM'],
+  'SYSTEM'
+),
+(
+  'Fatigue Prevention',
+  'FREQUENCY',
+  JSON '{"hours_since_last": {"less_than": 4}, "creator_tier": {"not_in": ["PREMIUM"]}}',
+  JSON '{"action": "BLOCK", "reason": "Too frequent sending"}',
+  200,
+  ['HIGH', 'MED', 'LOW', 'NEW'],
+  ['PPV', 'BUMP', 'TIP'],
+  'SYSTEM'
+),
+(
+  'Low Performance Alert',
+  'CONTENT',
+  JSON '{"conversion_rate": {"less_than": 0.02}, "sends_count": {"greater_than": 10}}',
+  JSON '{"action": "ALERT", "message": "Content performance below threshold", "suggest_alternatives": true}',
+  150,
+  ['ALL'],
+  ['ALL'],
+  'SYSTEM'
+),
+(
+  'High Spender VIP Treatment',
+  'PRICING',
+  JSON '{"fan_segment": "WHALES", "fan_total_spent": {"greater_than": 500}}',
+  JSON '{"action": "SUGGEST_PREMIUM", "price_multiplier": 1.5, "personalization_required": true}',
+  90,
+  ['PREMIUM', 'HIGH'],
+  ['PPV', 'CUSTOM'],
+  'SYSTEM'
+);
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'reference_enums',
+  'SUCCESS',
+  'Created comprehensive reference data with creator tiers, content types, fan segments, and business rules',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L1.01 COMPLETE' as status,
+  'Reference enums created with intelligent business logic foundation' as message,
+  CURRENT_TIMESTAMP() as completed_at;

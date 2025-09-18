@@ -1,0 +1,528 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L1", "sanity_checks"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.07: Sanity Checks - Semantic Layer Data Quality
+-- =====================================================================
+-- Comprehensive data quality monitoring for the semantic layer with
+-- business logic validation and intelligent anomaly detection.
+-- =====================================================================
+
+-- =====================================================================
+-- SEMANTIC LAYER DATA QUALITY VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_01_semantic.v_l1_data_quality_summary` AS
+WITH data_completeness AS (
+  -- Check data completeness across semantic views
+  SELECT
+    'v_message_facts_by_page' AS view_name,
+    COUNT(*) AS total_records,
+    COUNTIF(creator_username IS NOT NULL) AS complete_creator_username,
+    COUNTIF(creator_tier IS NOT NULL) AS complete_creator_tier,
+    COUNTIF(content_category IS NOT NULL) AS complete_content_category,
+    COUNTIF(send_date IS NOT NULL) AS complete_send_date,
+    COUNTIF(conversion_rate IS NOT NULL AND conversion_rate >= 0) AS valid_conversion_rate,
+    COUNTIF(revenue_per_message IS NOT NULL AND revenue_per_message >= 0) AS valid_rpm,
+    MIN(send_date) AS earliest_data,
+    MAX(send_date) AS latest_data,
+    CURRENT_TIMESTAMP() AS check_time
+  FROM `layer_01_semantic.v_message_facts_by_page`
+
+  UNION ALL
+
+  SELECT
+    'v_creator_weekly',
+    COUNT(*),
+    COUNTIF(creator_username IS NOT NULL),
+    COUNTIF(creator_tier IS NOT NULL),
+    COUNTIF(week_start_date IS NOT NULL),
+    COUNTIF(week_start_date IS NOT NULL),
+    COUNTIF(avg_conversion_rate IS NOT NULL AND avg_conversion_rate >= 0),
+    COUNTIF(avg_rpm IS NOT NULL AND avg_rpm >= 0),
+    MIN(week_start_date),
+    MAX(week_start_date),
+    CURRENT_TIMESTAMP()
+  FROM `layer_01_semantic.v_creator_weekly`
+
+  UNION ALL
+
+  SELECT
+    'v_caption_dim',
+    COUNT(*),
+    NULL,  -- Not applicable
+    NULL,  -- Not applicable
+    COUNTIF(content_category IS NOT NULL),
+    COUNTIF(first_used_date IS NOT NULL),
+    COUNTIF(avg_conversion_rate IS NOT NULL AND avg_conversion_rate >= 0),
+    COUNTIF(avg_rpm IS NOT NULL AND avg_rpm >= 0),
+    MIN(first_used_date),
+    MAX(last_used_date),
+    CURRENT_TIMESTAMP()
+  FROM `layer_01_semantic.v_caption_dim`
+
+  UNION ALL
+
+  SELECT
+    'v_page_dim',
+    COUNT(*),
+    COUNTIF(creator_username IS NOT NULL),
+    COUNTIF(creator_tier IS NOT NULL),
+    NULL,  -- Not applicable
+    COUNTIF(first_activity_date IS NOT NULL),
+    COUNTIF(avg_conversion_rate IS NOT NULL AND avg_conversion_rate >= 0),
+    COUNTIF(avg_rpm IS NOT NULL AND avg_rpm >= 0),
+    MIN(first_activity_date),
+    MAX(last_activity_date),
+    CURRENT_TIMESTAMP()
+  FROM `layer_01_semantic.v_page_dim`
+),
+
+quality_metrics AS (
+  -- Calculate quality percentages and status
+  SELECT
+    view_name,
+    total_records,
+
+    -- Completeness percentages
+    ROUND(complete_creator_username / total_records * 100, 2) AS creator_completeness_pct,
+    ROUND(complete_creator_tier / total_records * 100, 2) AS tier_completeness_pct,
+    ROUND(complete_content_category / total_records * 100, 2) AS category_completeness_pct,
+    ROUND(complete_send_date / total_records * 100, 2) AS date_completeness_pct,
+    ROUND(valid_conversion_rate / total_records * 100, 2) AS conversion_validity_pct,
+    ROUND(valid_rpm / total_records * 100, 2) AS rpm_validity_pct,
+
+    -- Data freshness
+    DATE_DIFF(CURRENT_DATE(), DATE(latest_data), DAY) AS days_since_latest_data,
+    DATE_DIFF(DATE(latest_data), DATE(earliest_data), DAY) AS data_span_days,
+
+    check_time
+
+  FROM data_completeness
+)
+
+SELECT
+  view_name,
+  total_records,
+  creator_completeness_pct,
+  tier_completeness_pct,
+  category_completeness_pct,
+  date_completeness_pct,
+  conversion_validity_pct,
+  rpm_validity_pct,
+
+  -- Overall quality score
+  ROUND((
+    COALESCE(creator_completeness_pct, 100) +
+    COALESCE(tier_completeness_pct, 100) +
+    COALESCE(category_completeness_pct, 100) +
+    date_completeness_pct +
+    conversion_validity_pct +
+    rpm_validity_pct
+  ) / 6, 2) AS overall_quality_score,
+
+  -- Data freshness status
+  days_since_latest_data,
+  CASE
+    WHEN days_since_latest_data <= 1 THEN 'FRESH'
+    WHEN days_since_latest_data <= 3 THEN 'RECENT'
+    WHEN days_since_latest_data <= 7 THEN 'STALE'
+    ELSE 'VERY_STALE'
+  END AS freshness_status,
+
+  -- Quality status
+  CASE
+    WHEN (
+      COALESCE(creator_completeness_pct, 100) +
+      COALESCE(tier_completeness_pct, 100) +
+      COALESCE(category_completeness_pct, 100) +
+      date_completeness_pct +
+      conversion_validity_pct +
+      rpm_validity_pct
+    ) / 6 >= 95 THEN 'EXCELLENT'
+    WHEN (
+      COALESCE(creator_completeness_pct, 100) +
+      COALESCE(tier_completeness_pct, 100) +
+      COALESCE(category_completeness_pct, 100) +
+      date_completeness_pct +
+      conversion_validity_pct +
+      rpm_validity_pct
+    ) / 6 >= 85 THEN 'GOOD'
+    WHEN (
+      COALESCE(creator_completeness_pct, 100) +
+      COALESCE(tier_completeness_pct, 100) +
+      COALESCE(category_completeness_pct, 100) +
+      date_completeness_pct +
+      conversion_validity_pct +
+      rpm_validity_pct
+    ) / 6 >= 70 THEN 'FAIR'
+    ELSE 'POOR'
+  END AS quality_status,
+
+  data_span_days,
+  check_time
+
+FROM quality_metrics
+ORDER BY view_name;
+
+-- =====================================================================
+-- BUSINESS LOGIC VALIDATION VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_01_semantic.v_l1_business_logic_validation` AS
+WITH tier_validation AS (
+  -- Validate creator tier assignments against actual performance
+  SELECT
+    creator_username,
+    creator_tier AS assigned_tier,
+    calculated_performance_tier,
+    avg_rpm,
+    avg_conversion_rate,
+    total_earnings,
+
+    -- Tier mismatch severity
+    CASE
+      WHEN creator_tier = 'PREMIUM' AND calculated_performance_tier NOT IN ('PREMIUM', 'HIGH') THEN 'SEVERE_DOWNGRADE'
+      WHEN creator_tier = 'HIGH' AND calculated_performance_tier IN ('LOW', 'NEW') THEN 'SEVERE_DOWNGRADE'
+      WHEN creator_tier != calculated_performance_tier THEN 'MODERATE_MISMATCH'
+      ELSE 'ALIGNED'
+    END AS tier_alignment_status,
+
+    -- Performance vs tier requirements
+    CASE
+      WHEN creator_tier = 'PREMIUM' AND (avg_rpm < 2.0 OR avg_conversion_rate < 0.08) THEN 'BELOW_TIER_MINIMUM'
+      WHEN creator_tier = 'HIGH' AND (avg_rpm < 1.25 OR avg_conversion_rate < 0.06) THEN 'BELOW_TIER_MINIMUM'
+      WHEN creator_tier = 'MED' AND (avg_rpm < 0.75 OR avg_conversion_rate < 0.04) THEN 'BELOW_TIER_MINIMUM'
+      WHEN creator_tier = 'LOW' AND (avg_rpm < 0.25 OR avg_conversion_rate < 0.02) THEN 'BELOW_TIER_MINIMUM'
+      ELSE 'MEETS_REQUIREMENTS'
+    END AS tier_requirements_status
+
+  FROM `layer_01_semantic.v_page_dim`
+),
+
+content_validation AS (
+  -- Validate content classification and performance consistency
+  SELECT
+    content_category,
+    COUNT(*) AS caption_count,
+    AVG(avg_conversion_rate) AS category_avg_conversion,
+    AVG(avg_rpm) AS category_avg_rpm,
+    STDDEV(avg_conversion_rate) AS conversion_stddev,
+    STDDEV(avg_rpm) AS rpm_stddev,
+
+    -- Identify outliers within category
+    COUNTIF(avg_conversion_rate > (AVG(avg_conversion_rate) + 2 * STDDEV(avg_conversion_rate))) AS high_outliers,
+    COUNTIF(avg_conversion_rate < (AVG(avg_conversion_rate) - 2 * STDDEV(avg_conversion_rate))) AS low_outliers,
+
+    -- Performance consistency within category
+    CASE
+      WHEN STDDEV(avg_conversion_rate) / AVG(avg_conversion_rate) <= 0.5 THEN 'CONSISTENT'
+      WHEN STDDEV(avg_conversion_rate) / AVG(avg_conversion_rate) <= 1.0 THEN 'MODERATE_VARIATION'
+      ELSE 'HIGH_VARIATION'
+    END AS category_consistency
+
+  FROM `layer_01_semantic.v_caption_dim`
+  GROUP BY content_category
+),
+
+performance_anomalies AS (
+  -- Detect performance anomalies across the semantic layer
+  SELECT
+    'CREATOR_PERFORMANCE' AS anomaly_type,
+    creator_username AS entity_id,
+    'RPM_OUTLIER' AS anomaly_subtype,
+    avg_rpm AS metric_value,
+    CONCAT('Creator RPM of ', ROUND(avg_rpm, 2), ' is significantly different from tier average') AS description
+  FROM `layer_01_semantic.v_page_dim`
+  WHERE avg_rpm > (
+    SELECT AVG(avg_rpm) + 3 * STDDEV(avg_rpm)
+    FROM `layer_01_semantic.v_page_dim`
+    WHERE creator_tier = (SELECT creator_tier FROM `layer_01_semantic.v_page_dim` p WHERE p.creator_username = creator_username)
+  )
+  OR avg_rpm < (
+    SELECT AVG(avg_rpm) - 3 * STDDEV(avg_rpm)
+    FROM `layer_01_semantic.v_page_dim`
+    WHERE creator_tier = (SELECT creator_tier FROM `layer_01_semantic.v_page_dim` p WHERE p.creator_username = creator_username)
+  )
+
+  UNION ALL
+
+  SELECT
+    'CONTENT_PERFORMANCE',
+    caption_hash,
+    'PERFORMANCE_INCONSISTENCY',
+    avg_rpm,
+    CONCAT('Caption performance varies significantly across uses (RPM: ', ROUND(avg_rpm, 2), ')')
+  FROM `layer_01_semantic.v_caption_dim`
+  WHERE performance_tier = 'POOR_PERFORMER' AND total_usage_count >= 10
+
+  UNION ALL
+
+  SELECT
+    'WEEKLY_TRENDS',
+    creator_username,
+    'EARNINGS_VOLATILITY',
+    earnings_volatility,
+    CONCAT('High earnings volatility: ', ROUND(earnings_volatility, 2))
+  FROM `layer_01_semantic.v_creator_weekly`
+  WHERE consistency_rating IN ('INCONSISTENT', 'HIGHLY_VOLATILE')
+)
+
+-- Combine all validation results
+SELECT
+  -- Tier validation summary
+  (SELECT COUNT(*) FROM tier_validation WHERE tier_alignment_status != 'ALIGNED') AS tier_misalignment_count,
+  (SELECT COUNT(*) FROM tier_validation WHERE tier_requirements_status = 'BELOW_TIER_MINIMUM') AS below_tier_minimum_count,
+  (SELECT COUNT(*) FROM tier_validation) AS total_creators,
+
+  -- Content validation summary
+  (SELECT COUNT(*) FROM content_validation WHERE category_consistency = 'HIGH_VARIATION') AS inconsistent_categories,
+  (SELECT SUM(high_outliers + low_outliers) FROM content_validation) AS content_outlier_count,
+
+  -- Anomaly summary
+  (SELECT COUNT(*) FROM performance_anomalies) AS total_anomalies,
+  (SELECT COUNT(DISTINCT anomaly_type) FROM performance_anomalies) AS anomaly_types,
+
+  -- Overall validation status
+  CASE
+    WHEN (SELECT COUNT(*) FROM tier_validation WHERE tier_alignment_status = 'SEVERE_DOWNGRADE') > 0 THEN 'CRITICAL_ISSUES'
+    WHEN (SELECT COUNT(*) FROM tier_validation WHERE tier_alignment_status != 'ALIGNED') > 5 THEN 'MAJOR_ISSUES'
+    WHEN (SELECT COUNT(*) FROM performance_anomalies) > 10 THEN 'MODERATE_ISSUES'
+    ELSE 'HEALTHY'
+  END AS overall_validation_status,
+
+  CURRENT_TIMESTAMP() AS validation_timestamp;
+
+-- =====================================================================
+-- REFERENTIAL INTEGRITY CHECKS VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_01_semantic.v_l1_referential_integrity` AS
+WITH reference_checks AS (
+  -- Check if all creator tiers in data exist in definitions
+  SELECT
+    'CREATOR_TIER_DEFINITIONS' AS check_name,
+    COUNT(DISTINCT mf.creator_tier) AS distinct_values_in_data,
+    COUNT(DISTINCT td.tier_name) AS defined_values,
+    COUNT(DISTINCT mf.creator_tier) - COUNT(DISTINCT td.tier_name) AS undefined_values,
+    ARRAY_AGG(DISTINCT mf.creator_tier ORDER BY mf.creator_tier) AS data_values,
+    ARRAY_AGG(DISTINCT td.tier_name ORDER BY td.tier_name) AS defined_values_array
+  FROM `layer_01_semantic.v_message_facts_by_page` mf
+  FULL OUTER JOIN `layer_01_semantic.creator_tier_definitions` td
+    ON mf.creator_tier = td.tier_name
+  GROUP BY check_name
+
+  UNION ALL
+
+  -- Check if all content categories in data exist in definitions
+  SELECT
+    'CONTENT_TYPE_DEFINITIONS',
+    COUNT(DISTINCT mf.content_category),
+    COUNT(DISTINCT ctd.content_type),
+    COUNT(DISTINCT mf.content_category) - COUNT(DISTINCT ctd.content_type),
+    ARRAY_AGG(DISTINCT mf.content_category ORDER BY mf.content_category),
+    ARRAY_AGG(DISTINCT ctd.content_type ORDER BY ctd.content_type)
+  FROM `layer_01_semantic.v_message_facts_by_page` mf
+  FULL OUTER JOIN `layer_01_semantic.content_type_definitions` ctd
+    ON mf.content_category = ctd.content_type
+  GROUP BY check_name
+),
+
+orphaned_records AS (
+  -- Find records that don't have corresponding reference data
+  SELECT
+    'ORPHANED_CREATORS' AS orphan_type,
+    COUNT(*) AS orphaned_count,
+    ARRAY_AGG(DISTINCT creator_username LIMIT 10) AS sample_orphaned_values
+  FROM `layer_01_semantic.v_message_facts_by_page` mf
+  LEFT JOIN `reference.creator_profiles` cp
+    ON mf.creator_username = cp.username_std
+  WHERE cp.username_std IS NULL
+
+  UNION ALL
+
+  SELECT
+    'UNDEFINED_TIERS',
+    COUNT(*),
+    ARRAY_AGG(DISTINCT creator_tier LIMIT 10)
+  FROM `layer_01_semantic.v_message_facts_by_page` mf
+  LEFT JOIN `layer_01_semantic.creator_tier_definitions` td
+    ON mf.creator_tier = td.tier_name
+  WHERE td.tier_name IS NULL
+
+  UNION ALL
+
+  SELECT
+    'UNDEFINED_CONTENT_TYPES',
+    COUNT(*),
+    ARRAY_AGG(DISTINCT content_category LIMIT 10)
+  FROM `layer_01_semantic.v_message_facts_by_page` mf
+  LEFT JOIN `layer_01_semantic.content_type_definitions` ctd
+    ON mf.content_category = ctd.content_type
+  WHERE ctd.content_type IS NULL
+),
+
+consistency_checks AS (
+  -- Check cross-view consistency
+  SELECT
+    'CREATOR_COUNT_CONSISTENCY' AS consistency_check,
+    (SELECT COUNT(DISTINCT creator_username) FROM `layer_01_semantic.v_message_facts_by_page`) AS message_facts_creators,
+    (SELECT COUNT(DISTINCT creator_username) FROM `layer_01_semantic.v_page_dim`) AS page_dim_creators,
+    (SELECT COUNT(DISTINCT creator_username) FROM `layer_01_semantic.v_creator_weekly`) AS weekly_creators,
+    ABS((SELECT COUNT(DISTINCT creator_username) FROM `layer_01_semantic.v_message_facts_by_page`) -
+        (SELECT COUNT(DISTINCT creator_username) FROM `layer_01_semantic.v_page_dim`)) AS creator_count_difference
+)
+
+-- Main query combining all integrity checks
+SELECT
+  -- Reference data integrity
+  (SELECT SUM(undefined_values) FROM reference_checks) AS total_undefined_references,
+  (SELECT COUNT(*) FROM reference_checks WHERE undefined_values > 0) AS tables_with_undefined_refs,
+
+  -- Orphaned records
+  (SELECT SUM(orphaned_count) FROM orphaned_records) AS total_orphaned_records,
+  (SELECT COUNT(*) FROM orphaned_records WHERE orphaned_count > 0) AS orphan_types_found,
+
+  -- Cross-view consistency
+  (SELECT creator_count_difference FROM consistency_checks WHERE consistency_check = 'CREATOR_COUNT_CONSISTENCY') AS creator_count_variance,
+
+  -- Overall integrity status
+  CASE
+    WHEN (SELECT SUM(undefined_values) FROM reference_checks) > 0 THEN 'REFERENCE_INTEGRITY_ISSUES'
+    WHEN (SELECT SUM(orphaned_count) FROM orphaned_records) > 100 THEN 'SIGNIFICANT_ORPHANED_DATA'
+    WHEN (SELECT creator_count_difference FROM consistency_checks WHERE consistency_check = 'CREATOR_COUNT_CONSISTENCY') > 10 THEN 'CROSS_VIEW_INCONSISTENCY'
+    ELSE 'GOOD_INTEGRITY'
+  END AS integrity_status,
+
+  CURRENT_TIMESTAMP() AS integrity_check_timestamp;
+
+-- =====================================================================
+-- SANITY CHECK PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_01_semantic.sp_run_l1_sanity_checks`()
+BEGIN
+  DECLARE check_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE critical_issues INT64 DEFAULT 0;
+  DECLARE warning_issues INT64 DEFAULT 0;
+
+  -- Check 1: Data quality across semantic views
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+    check_timestamp, table_name, check_type, metric_name,
+    metric_value, threshold_min, threshold_max, status, details
+  )
+  SELECT
+    check_timestamp,
+    'layer_01_semantic',
+    'QUALITY',
+    'avg_quality_score',
+    (SELECT AVG(overall_quality_score) FROM `layer_01_semantic.v_l1_data_quality_summary`),
+    85.0,  -- Minimum 85% quality
+    NULL,
+    CASE
+      WHEN (SELECT AVG(overall_quality_score) FROM `layer_01_semantic.v_l1_data_quality_summary`) < 70 THEN 'FAIL'
+      WHEN (SELECT AVG(overall_quality_score) FROM `layer_01_semantic.v_l1_data_quality_summary`) < 85 THEN 'WARN'
+      ELSE 'PASS'
+    END,
+    TO_JSON_STRING(STRUCT(
+      (SELECT COUNT(*) FROM `layer_01_semantic.v_l1_data_quality_summary` WHERE quality_status = 'POOR') AS poor_views,
+      (SELECT COUNT(*) FROM `layer_01_semantic.v_l1_data_quality_summary` WHERE freshness_status = 'VERY_STALE') AS stale_views
+    ));
+
+  -- Check 2: Business logic validation
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+    check_timestamp, table_name, check_type, metric_name,
+    metric_value, threshold_min, threshold_max, status, details
+  )
+  SELECT
+    check_timestamp,
+    'layer_01_semantic',
+    'CONSISTENCY',
+    'tier_misalignment_rate',
+    (SELECT tier_misalignment_count / total_creators FROM `layer_01_semantic.v_l1_business_logic_validation`),
+    NULL,
+    0.1,  -- Maximum 10% misalignment
+    CASE
+      WHEN (SELECT tier_misalignment_count / total_creators FROM `layer_01_semantic.v_l1_business_logic_validation`) > 0.2 THEN 'FAIL'
+      WHEN (SELECT tier_misalignment_count / total_creators FROM `layer_01_semantic.v_l1_business_logic_validation`) > 0.1 THEN 'WARN'
+      ELSE 'PASS'
+    END,
+    TO_JSON_STRING(STRUCT(
+      (SELECT overall_validation_status FROM `layer_01_semantic.v_l1_business_logic_validation`) AS validation_status
+    ));
+
+  -- Check 3: Referential integrity
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+    check_timestamp, table_name, check_type, metric_name,
+    metric_value, threshold_min, threshold_max, status, details
+  )
+  SELECT
+    check_timestamp,
+    'layer_01_semantic',
+    'INTEGRITY',
+    'orphaned_records_count',
+    (SELECT total_orphaned_records FROM `layer_01_semantic.v_l1_referential_integrity`),
+    NULL,
+    100,  -- Maximum 100 orphaned records
+    CASE
+      WHEN (SELECT total_orphaned_records FROM `layer_01_semantic.v_l1_referential_integrity`) > 1000 THEN 'FAIL'
+      WHEN (SELECT total_orphaned_records FROM `layer_01_semantic.v_l1_referential_integrity`) > 100 THEN 'WARN'
+      ELSE 'PASS'
+    END,
+    TO_JSON_STRING(STRUCT(
+      (SELECT integrity_status FROM `layer_01_semantic.v_l1_referential_integrity`) AS integrity_status
+    ));
+
+  -- Count issues
+  SET critical_issues = (
+    SELECT COUNTIF(status = 'FAIL')
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics`
+    WHERE check_timestamp = check_timestamp
+      AND table_name = 'layer_01_semantic'
+  );
+
+  SET warning_issues = (
+    SELECT COUNTIF(status = 'WARN')
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics`
+    WHERE check_timestamp = check_timestamp
+      AND table_name = 'layer_01_semantic'
+  );
+
+  -- Log results
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L1', 'sanity_checks',
+    CASE WHEN critical_issues > 0 THEN 'FAILED' WHEN warning_issues > 0 THEN 'WARNING' ELSE 'SUCCESS' END,
+    FORMAT('L1 sanity checks completed: %d critical, %d warnings', critical_issues, warning_issues),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'sanity_checks',
+  'SUCCESS',
+  'Created comprehensive semantic layer data quality monitoring with business logic validation',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L1.07 COMPLETE' as status,
+  'Semantic layer sanity checks created with business logic validation and referential integrity monitoring' as message,
+  CURRENT_TIMESTAMP() as completed_at;

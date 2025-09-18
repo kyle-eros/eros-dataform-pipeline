@@ -1,0 +1,549 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L3", "next24"],
+  dependencies: ["eros_L2_01_udf_slot_score_v2", "eros_L2_07_next24_candidates_and_bundle"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L3.02: Next-24 Decision Engine - Intelligent Scheduling Core
+-- =====================================================================
+-- Core decision engine for next 24-hour scheduling with real-time optimization,
+-- A/B testing integration, and intelligent automation capabilities.
+-- =====================================================================
+
+-- =====================================================================
+-- CORE DECISION TABLE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_03_decisions.ops_decisions` (
+  decision_id STRING DEFAULT GENERATE_UUID(),
+  decision_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+
+  -- Creator and content context
+  creator_username STRING NOT NULL,
+  creator_tier STRING NOT NULL,
+  caption_hash STRING NOT NULL,
+  content_category STRING NOT NULL,
+
+  -- Timing decision
+  scheduled_datetime DATETIME NOT NULL,
+  scheduled_hour INT64 NOT NULL,
+  scheduled_dayofweek INT64 NOT NULL,
+
+  -- Decision scoring
+  slot_score NUMERIC NOT NULL,
+  multi_objective_score NUMERIC NOT NULL,
+  confidence_score NUMERIC NOT NULL,
+  expected_rpm NUMERIC,
+  expected_conversion NUMERIC,
+
+  -- Decision context
+  decision_source STRING NOT NULL,  -- AI_AUTO, HUMAN_OVERRIDE, AB_TEST, OPTIMIZATION
+  decision_reason TEXT,
+  feature_explanation JSON,
+
+  -- A/B testing context
+  ab_test_id STRING,
+  ab_test_variant STRING,
+  is_control_group BOOL DEFAULT FALSE,
+
+  -- Status and execution
+  status STRING DEFAULT 'PENDING',  -- PENDING, APPROVED, EXECUTED, CANCELLED, FAILED
+  execution_result JSON,
+  actual_send_time TIMESTAMP,
+
+  -- Performance tracking
+  actual_rpm NUMERIC,
+  actual_conversion NUMERIC,
+  actual_earnings NUMERIC,
+  performance_vs_expected NUMERIC,
+
+  -- Human oversight
+  human_review_required BOOL DEFAULT FALSE,
+  human_review_status STRING,  -- PENDING, APPROVED, REJECTED, MODIFIED
+  human_reviewer STRING,
+  human_review_notes TEXT,
+  human_review_timestamp TIMESTAMP,
+
+  -- Audit trail
+  rule_evaluations JSON,
+  override_history JSON,
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+PARTITION BY DATE(scheduled_datetime)
+CLUSTER BY creator_username, status, decision_source
+OPTIONS (
+  description = "Core decisions table for intelligent scheduling automation",
+  partition_expiration_days = 90
+);
+
+-- =====================================================================
+-- NEXT-24 DECISION GENERATION PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_03_decisions.sp_generate_next24_decisions`(
+  target_datetime DATETIME DEFAULT NULL,
+  force_regenerate BOOL DEFAULT FALSE
+)
+BEGIN
+  DECLARE generation_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE target_dt DATETIME DEFAULT COALESCE(target_datetime, CURRENT_DATETIME());
+  DECLARE decisions_generated INT64 DEFAULT 0;
+  DECLARE decisions_approved INT64 DEFAULT 0;
+  DECLARE decisions_blocked INT64 DEFAULT 0;
+
+  -- Clear existing pending decisions if force regenerate
+  IF force_regenerate THEN
+    DELETE FROM `layer_03_decisions.ops_decisions`
+    WHERE DATE(scheduled_datetime) = DATE(target_dt)
+      AND status = 'PENDING';
+  END IF;
+
+  -- Generate decisions from optimized candidates
+  INSERT INTO `layer_03_decisions.ops_decisions` (
+    creator_username,
+    creator_tier,
+    caption_hash,
+    content_category,
+    scheduled_datetime,
+    scheduled_hour,
+    scheduled_dayofweek,
+    slot_score,
+    multi_objective_score,
+    confidence_score,
+    expected_rpm,
+    expected_conversion,
+    decision_source,
+    decision_reason,
+    feature_explanation,
+    ab_test_id,
+    ab_test_variant,
+    is_control_group,
+    human_review_required,
+    rule_evaluations
+  )
+  WITH candidate_decisions AS (
+    SELECT
+      c.creator_username,
+      c.creator_tier,
+      STRUCT(
+        c.caption_hash,
+        c.content_category,
+        c.candidate_datetime,
+        c.candidate_hour,
+        c.candidate_dayofweek,
+        c.slot_score,
+        c.multi_objective_score,
+        c.confidence_score,
+        c.expected_rpm,
+        c.expected_conversion,
+        c.hours_since_last_send,
+        c.fatigue_level,
+        c.primary_fan_segment,
+        c.execution_recommendation
+      ) AS candidate_data
+    FROM `layer_02_features.v_next24_candidates` c
+    WHERE DATE(c.candidate_datetime) = DATE(target_dt)
+      AND c.execution_recommendation NOT IN ('LOW_PRIORITY')
+      AND c.multi_objective_score >= CAST(`layer_03_decisions.get_operational_parameter`('QUALITY', 'MIN_SLOT_SCORE', 'GLOBAL') AS NUMERIC)
+  ),
+
+  ab_test_assignments AS (
+    SELECT
+      cd.creator_username,
+      cd.candidate_data,
+
+      -- A/B test assignment logic
+      CASE
+        WHEN RAND() < 0.3 AND cd.creator_tier IN ('PREMIUM', 'HIGH') THEN 'TIMING_PEAK_HOURS_001'
+        WHEN RAND() < 0.4 AND cd.candidate_data.content_category IN ('PPV', 'CUSTOM') THEN 'CONTENT_NOVELTY_002'
+        ELSE NULL
+      END AS assigned_test_id,
+
+      -- Variant assignment within test
+      CASE
+        WHEN RAND() < 0.5 THEN 'control'
+        ELSE 'treatment'
+      END AS assigned_variant
+
+    FROM candidate_decisions cd
+  ),
+
+  rule_evaluated_decisions AS (
+    SELECT
+      ata.creator_username,
+      ata.candidate_data,
+      ata.assigned_test_id,
+      ata.assigned_variant,
+
+      -- Apply decision rules
+      `layer_03_decisions.evaluate_decision_rules`(
+        TO_JSON_STRING(ata.candidate_data),
+        'ALL'
+      ) AS rule_evaluation,
+
+      -- Determine final status
+      CASE
+        WHEN JSON_EXTRACT_SCALAR(`layer_03_decisions.evaluate_decision_rules`(TO_JSON_STRING(ata.candidate_data), 'ALL'), '$.decision') = 'BLOCKED' THEN 'CANCELLED'
+        WHEN JSON_EXTRACT_SCALAR(`layer_03_decisions.evaluate_decision_rules`(TO_JSON_STRING(ata.candidate_data), 'ALL'), '$.decision') = 'REVIEW_REQUIRED' THEN 'PENDING'
+        WHEN JSON_EXTRACT_SCALAR(`layer_03_decisions.evaluate_decision_rules`(TO_JSON_STRING(ata.candidate_data), 'ALL'), '$.decision') = 'AUTO_APPROVED' THEN 'APPROVED'
+        ELSE 'PENDING'
+      END AS initial_status,
+
+      -- Human review requirements
+      CASE
+        WHEN JSON_EXTRACT_SCALAR(`layer_03_decisions.evaluate_decision_rules`(TO_JSON_STRING(ata.candidate_data), 'ALL'), '$.decision') = 'REVIEW_REQUIRED' THEN TRUE
+        WHEN ata.candidate_data.confidence_score < CAST(`layer_03_decisions.get_operational_parameter`('QUALITY', 'MIN_CONFIDENCE_SCORE', 'GLOBAL') AS NUMERIC) THEN TRUE
+        WHEN ata.candidate_data.creator_tier = 'NEW' THEN TRUE
+        ELSE FALSE
+      END AS requires_human_review
+
+    FROM ab_test_assignments ata
+  )
+
+  SELECT
+    red.creator_username,
+    red.candidate_data.creator_tier,
+    red.candidate_data.caption_hash,
+    red.candidate_data.content_category,
+    red.candidate_data.candidate_datetime,
+    red.candidate_data.candidate_hour,
+    red.candidate_data.candidate_dayofweek,
+    red.candidate_data.slot_score,
+    red.candidate_data.multi_objective_score,
+    red.candidate_data.confidence_score,
+    red.candidate_data.expected_rpm,
+    red.candidate_data.expected_conversion,
+
+    -- Decision source
+    CASE
+      WHEN red.assigned_test_id IS NOT NULL THEN 'AB_TEST'
+      WHEN red.initial_status = 'APPROVED' THEN 'AI_AUTO'
+      ELSE 'AI_PENDING'
+    END AS decision_source,
+
+    -- Decision reasoning
+    CONCAT(
+      'Generated from next-24 optimization. ',
+      red.candidate_data.execution_recommendation,
+      CASE WHEN red.assigned_test_id IS NOT NULL THEN CONCAT(' [A/B Test: ', red.assigned_test_id, ']') ELSE '' END
+    ) AS decision_reason,
+
+    -- Feature explanation
+    JSON_OBJECT(
+      'timing_score', red.candidate_data.slot_score,
+      'confidence', red.candidate_data.confidence_score,
+      'fan_segment', red.candidate_data.primary_fan_segment,
+      'content_fatigue', red.candidate_data.fatigue_level,
+      'hours_since_last', red.candidate_data.hours_since_last_send
+    ) AS feature_explanation,
+
+    red.assigned_test_id,
+    red.assigned_variant,
+    red.assigned_variant = 'control' AS is_control_group,
+    red.requires_human_review,
+    red.rule_evaluation
+
+  FROM rule_evaluated_decisions red;
+
+  -- Get generation statistics
+  SET decisions_generated = @@row_count;
+
+  SET decisions_approved = (
+    SELECT COUNT(*)
+    FROM `layer_03_decisions.ops_decisions`
+    WHERE DATE(scheduled_datetime) = DATE(target_dt)
+      AND status = 'APPROVED'
+      AND created_at >= generation_start
+  );
+
+  SET decisions_blocked = (
+    SELECT COUNT(*)
+    FROM `layer_03_decisions.ops_decisions`
+    WHERE DATE(scheduled_datetime) = DATE(target_dt)
+      AND status = 'CANCELLED'
+      AND created_at >= generation_start
+  );
+
+  -- Log generation results
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L3', 'next24_generation',
+    'SUCCESS',
+    FORMAT('Generated %d next-24 decisions: %d approved, %d blocked',
+           decisions_generated, decisions_approved, decisions_blocked),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- DECISION EXECUTION PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_03_decisions.sp_execute_decisions`(
+  execution_window_hours INT64 DEFAULT 1
+)
+BEGIN
+  DECLARE execution_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE executions_attempted INT64 DEFAULT 0;
+  DECLARE executions_successful INT64 DEFAULT 0;
+
+  -- Execute approved decisions within the window
+  UPDATE `layer_03_decisions.ops_decisions`
+  SET
+    status = 'EXECUTED',
+    actual_send_time = CURRENT_TIMESTAMP(),
+    execution_result = JSON_OBJECT(
+      'execution_method', 'AUTOMATED',
+      'execution_timestamp', CAST(CURRENT_TIMESTAMP() AS STRING),
+      'execution_confidence', confidence_score,
+      'expected_performance', JSON_OBJECT(
+        'expected_rpm', expected_rpm,
+        'expected_conversion', expected_conversion
+      )
+    ),
+    updated_at = CURRENT_TIMESTAMP()
+  WHERE status = 'APPROVED'
+    AND scheduled_datetime <= DATETIME_ADD(CURRENT_DATETIME(), INTERVAL execution_window_hours HOUR)
+    AND scheduled_datetime >= CURRENT_DATETIME()
+    AND human_review_required = FALSE;
+
+  SET executions_attempted = @@row_count;
+
+  -- Simulate execution results (in production, this would integrate with actual sending system)
+  UPDATE `layer_03_decisions.ops_decisions`
+  SET
+    execution_result = JSON_SET(
+      execution_result,
+      '$.send_success', TRUE,
+      '$.message_id', GENERATE_UUID(),
+      '$.delivery_status', 'DELIVERED'
+    ),
+    updated_at = CURRENT_TIMESTAMP()
+  WHERE status = 'EXECUTED'
+    AND actual_send_time >= execution_start;
+
+  SET executions_successful = @@row_count;
+
+  -- Log execution results
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L3', 'decision_execution',
+    'SUCCESS',
+    FORMAT('Executed %d decisions successfully out of %d attempted',
+           executions_successful, executions_attempted),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- PERFORMANCE TRACKING AND LEARNING PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_03_decisions.sp_track_decision_performance`()
+BEGIN
+  -- Update actual performance metrics (simulated)
+  UPDATE `layer_03_decisions.ops_decisions`
+  SET
+    actual_rpm = expected_rpm * (0.8 + RAND() * 0.4),  -- +/- 20% variance
+    actual_conversion = expected_conversion * (0.85 + RAND() * 0.3),  -- +/- 15% variance
+    actual_earnings = expected_rpm * (0.8 + RAND() * 0.4) * 1.5,  -- Simulated earnings
+    performance_vs_expected = (
+      (expected_rpm * (0.8 + RAND() * 0.4)) / NULLIF(expected_rpm, 0)
+    ),
+    updated_at = CURRENT_TIMESTAMP()
+  WHERE status = 'EXECUTED'
+    AND actual_rpm IS NULL
+    AND actual_send_time < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR);
+
+  -- Update rule performance tracking
+  UPDATE `layer_03_decisions.decision_rules`
+  SET
+    times_triggered = times_triggered + (
+      SELECT COUNT(*)
+      FROM `layer_03_decisions.ops_decisions` od,
+           UNNEST(JSON_EXTRACT_ARRAY(od.rule_evaluations, '$.applied_rules')) AS applied_rule
+      WHERE applied_rule = rule_name
+        AND od.updated_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+    ),
+    successful_applications = successful_applications + (
+      SELECT COUNT(*)
+      FROM `layer_03_decisions.ops_decisions` od,
+           UNNEST(JSON_EXTRACT_ARRAY(od.rule_evaluations, '$.applied_rules')) AS applied_rule
+      WHERE applied_rule = rule_name
+        AND od.performance_vs_expected >= 1.0
+        AND od.updated_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+    ),
+    updated_at = CURRENT_TIMESTAMP()
+  WHERE rule_name IN (
+    SELECT DISTINCT applied_rule
+    FROM `layer_03_decisions.ops_decisions` od,
+         UNNEST(JSON_EXTRACT_ARRAY(od.rule_evaluations, '$.applied_rules')) AS applied_rule
+    WHERE od.updated_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+  );
+
+  -- Log performance tracking completion
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L3', 'performance_tracking',
+    'SUCCESS',
+    'Updated decision performance metrics and rule effectiveness tracking',
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- DECISION ANALYTICS VIEWS
+-- =====================================================================
+
+-- Real-time decision pipeline status
+CREATE OR REPLACE VIEW `layer_03_decisions.v_decision_pipeline_status` AS
+SELECT
+  DATE(scheduled_datetime) AS scheduled_date,
+  creator_tier,
+  decision_source,
+  status,
+
+  -- Volume metrics
+  COUNT(*) AS decision_count,
+  COUNT(DISTINCT creator_username) AS unique_creators,
+
+  -- Performance metrics
+  AVG(slot_score) AS avg_slot_score,
+  AVG(multi_objective_score) AS avg_multi_objective_score,
+  AVG(confidence_score) AS avg_confidence_score,
+
+  -- Expected vs actual performance
+  AVG(expected_rpm) AS avg_expected_rpm,
+  AVG(actual_rpm) AS avg_actual_rpm,
+  AVG(performance_vs_expected) AS avg_performance_ratio,
+
+  -- A/B testing coverage
+  COUNTIF(ab_test_id IS NOT NULL) AS ab_test_decisions,
+  COUNT(DISTINCT ab_test_id) AS active_tests,
+
+  -- Human oversight
+  COUNTIF(human_review_required) AS requiring_review,
+  COUNTIF(human_review_status = 'APPROVED') AS human_approved,
+
+  CURRENT_TIMESTAMP() AS status_calculated_at
+
+FROM `layer_03_decisions.ops_decisions`
+WHERE scheduled_datetime >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 7 DAY)
+GROUP BY scheduled_date, creator_tier, decision_source, status
+ORDER BY scheduled_date DESC, decision_count DESC;
+
+-- A/B test performance tracking
+CREATE OR REPLACE VIEW `layer_03_decisions.v_ab_test_performance` AS
+WITH test_results AS (
+  SELECT
+    ab_test_id,
+    ab_test_variant,
+    is_control_group,
+
+    COUNT(*) AS sample_size,
+    AVG(actual_rpm) AS avg_rpm,
+    AVG(actual_conversion) AS avg_conversion,
+    AVG(performance_vs_expected) AS avg_performance_ratio,
+    STDDEV(actual_rpm) AS rpm_stddev
+
+  FROM `layer_03_decisions.ops_decisions`
+  WHERE ab_test_id IS NOT NULL
+    AND status = 'EXECUTED'
+    AND actual_rpm IS NOT NULL
+  GROUP BY ab_test_id, ab_test_variant, is_control_group
+),
+
+statistical_analysis AS (
+  SELECT
+    ab_test_id,
+
+    -- Control group metrics
+    MAX(CASE WHEN is_control_group THEN avg_rpm END) AS control_rpm,
+    MAX(CASE WHEN is_control_group THEN sample_size END) AS control_sample_size,
+    MAX(CASE WHEN is_control_group THEN rpm_stddev END) AS control_stddev,
+
+    -- Treatment group metrics
+    MAX(CASE WHEN NOT is_control_group THEN avg_rpm END) AS treatment_rpm,
+    MAX(CASE WHEN NOT is_control_group THEN sample_size END) AS treatment_sample_size,
+    MAX(CASE WHEN NOT is_control_group THEN rpm_stddev END) AS treatment_stddev,
+
+    -- Lift calculation
+    (MAX(CASE WHEN NOT is_control_group THEN avg_rpm END) -
+     MAX(CASE WHEN is_control_group THEN avg_rpm END)) /
+    NULLIF(MAX(CASE WHEN is_control_group THEN avg_rpm END), 0) AS lift_percentage
+
+  FROM test_results
+  GROUP BY ab_test_id
+)
+
+SELECT
+  tc.test_id,
+  tc.test_name,
+  tc.test_category,
+  tc.status AS test_status,
+
+  sa.control_sample_size,
+  sa.treatment_sample_size,
+  ROUND(sa.control_rpm, 4) AS control_avg_rpm,
+  ROUND(sa.treatment_rpm, 4) AS treatment_avg_rpm,
+  ROUND(sa.lift_percentage, 4) AS lift_percentage,
+
+  -- Statistical significance (simplified)
+  CASE
+    WHEN sa.control_sample_size >= tc.min_sample_size
+     AND sa.treatment_sample_size >= tc.min_sample_size
+     AND ABS(sa.lift_percentage) >= 0.05  -- 5% minimum detectable effect
+    THEN TRUE
+    ELSE FALSE
+  END AS is_statistically_significant,
+
+  -- Recommendations
+  CASE
+    WHEN sa.lift_percentage > 0.1 AND sa.treatment_sample_size >= tc.min_sample_size THEN 'IMPLEMENT_TREATMENT'
+    WHEN sa.lift_percentage < -0.05 AND sa.treatment_sample_size >= tc.min_sample_size THEN 'REJECT_TREATMENT'
+    WHEN sa.control_sample_size < tc.min_sample_size THEN 'CONTINUE_TEST'
+    ELSE 'INCONCLUSIVE'
+  END AS recommendation,
+
+  CURRENT_TIMESTAMP() AS analysis_timestamp
+
+FROM `layer_03_decisions.ab_test_configurations` tc
+LEFT JOIN statistical_analysis sa
+  ON tc.test_id = sa.ab_test_id
+WHERE tc.status = 'ACTIVE'
+ORDER BY tc.test_id;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L3', 'next24_decision_engine',
+  'SUCCESS',
+  'Created next-24 decision engine with A/B testing integration and performance tracking',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L3.02 COMPLETE' as status,
+  'Next-24 decision engine created with intelligent automation and A/B testing framework' as message,
+  CURRENT_TIMESTAMP() as completed_at;

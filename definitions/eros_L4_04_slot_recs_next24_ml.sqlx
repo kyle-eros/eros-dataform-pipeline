@@ -1,0 +1,489 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L4", "slot_recs_next24_ml"],
+  dependencies: ["eros_L3_01_ops_config", "eros_L3_02_next24"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L4.04: ML-Enhanced Next24 Slot Recommendations
+-- ================================================================
+-- Production-ready ML recommendations for next 24-hour scheduling
+-- Integrates all ML models for optimized slot allocation
+-- ================================================================
+
+-- Core ML-enhanced slot recommendation engine
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_next24_ml_slot_recommendations` AS
+WITH time_grid AS (
+  -- Generate hourly slots for next 24 hours
+  SELECT
+    TIMESTAMP_ADD(
+      TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR),
+      INTERVAL hour_offset HOUR
+    ) AS slot_time,
+    hour_offset
+  FROM UNNEST(GENERATE_ARRAY(1, 24)) AS hour_offset
+),
+
+creator_universe AS (
+  SELECT DISTINCT
+    creator_name,
+    creator_tier,
+    avg_view_rate_30d,
+    avg_conversion_rate_30d,
+    total_revenue_30d,
+    total_messages_30d,
+    last_message_time
+  FROM `of-scheduler-proj.layer_01_semantic.v_message_facts_by_page`
+  WHERE is_active = true
+),
+
+slot_candidates AS (
+  SELECT
+    c.creator_name,
+    c.creator_tier,
+    t.slot_time,
+    t.hour_offset,
+
+    -- Time features for ML
+    EXTRACT(HOUR FROM t.slot_time) AS send_hour,
+    EXTRACT(DAYOFWEEK FROM t.slot_time) AS send_dow,
+    EXTRACT(DAY FROM t.slot_time) AS send_day,
+
+    -- Creator context
+    c.avg_view_rate_30d AS creator_avg_view_rate_30d,
+    c.avg_conversion_rate_30d AS creator_avg_conversion_rate_30d,
+    c.last_message_time,
+
+    -- Recency calculations
+    TIMESTAMP_DIFF(t.slot_time, c.last_message_time, HOUR) AS hours_since_last,
+
+    -- Historical performance for this slot
+    COALESCE(h.avg_view_rate, c.avg_view_rate_30d, 0.08) AS historical_slot_view_rate,
+    COALESCE(h.avg_conversion_rate, c.avg_conversion_rate_30d, 0.04) AS historical_slot_conversion_rate,
+
+    -- Default content features (can be customized per message)
+    120 AS message_length,
+    18 AS word_count,
+    1 AS has_price_mention,
+    1 AS has_urgency,
+    0 AS has_emoji,
+    25.0 AS price_numeric
+
+  FROM creator_universe c
+  CROSS JOIN time_grid t
+
+  LEFT JOIN `of-scheduler-proj.layer_02_features.v_creator_hourly_patterns` h
+    ON c.creator_name = h.creator_name
+    AND EXTRACT(HOUR FROM t.slot_time) = h.hour_of_day
+    AND EXTRACT(DAYOFWEEK FROM t.slot_time) = h.day_of_week
+
+  WHERE
+    -- Only consider viable time slots
+    EXTRACT(HOUR FROM t.slot_time) BETWEEN 6 AND 23
+    -- Minimum spacing between messages
+    AND TIMESTAMP_DIFF(t.slot_time, c.last_message_time, HOUR) >= 2
+),
+
+ml_predictions AS (
+  SELECT
+    s.*,
+
+    -- ML model predictions
+    p1.predicted_view_rate,
+    p2.predicted_conversion_rate,
+
+    -- Timing optimization prediction
+    p3.predicted_is_best_revenue_hour,
+    p3.predicted_is_best_revenue_hour_probs[OFFSET(0)].prob AS optimal_timing_probability,
+
+    -- Content performance prediction
+    p4.predicted_is_high_revenue,
+    p4.predicted_is_high_revenue_probs[OFFSET(0)].prob AS content_performance_probability
+
+  FROM slot_candidates s
+
+  -- View rate prediction
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_message_performance`,
+    (
+      SELECT
+        send_hour,
+        send_dow,
+        send_day,
+        message_length,
+        word_count,
+        has_price_mention,
+        has_urgency,
+        has_emoji,
+        creator_avg_view_rate_30d,
+        creator_avg_conversion_rate_30d,
+        ABS(send_hour - AVG(send_hour) OVER (PARTITION BY creator_name)) AS hour_deviation_from_avg,
+        price_numeric
+      FROM slot_candidates
+    )
+  ) p1 ON TRUE
+
+  -- Conversion rate prediction
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_conversion_rate`,
+    (
+      SELECT
+        send_hour,
+        send_dow,
+        message_length,
+        word_count,
+        has_price_mention,
+        has_urgency,
+        has_emoji,
+        creator_avg_view_rate_30d,
+        creator_avg_conversion_rate_30d,
+        price_numeric
+      FROM slot_candidates
+    )
+  ) p2 ON TRUE
+
+  -- Optimal timing prediction
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_optimal_timing`,
+    (
+      SELECT
+        send_hour,
+        send_dow,
+        COS(2 * 3.14159 * send_hour / 24) AS hour_cos,
+        SIN(2 * 3.14159 * send_hour / 24) AS hour_sin,
+        CASE WHEN send_dow = 1 THEN 1 ELSE 0 END AS is_sunday,
+        CASE WHEN send_dow = 7 THEN 1 ELSE 0 END AS is_saturday,
+        CASE WHEN send_dow IN (2,3,4,5,6) THEN 1 ELSE 0 END AS is_weekday,
+        historical_slot_view_rate AS avg_view_rate,
+        historical_slot_conversion_rate AS avg_conversion_rate,
+        1.0 AS revenue_ratio_vs_day_avg,
+        1.0 AS view_rate_ratio_vs_day_avg
+      FROM slot_candidates
+    )
+  ) p3 ON TRUE
+
+  -- Content performance prediction
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_content_performance`,
+    (
+      SELECT
+        message_length AS char_count,
+        word_count,
+        2 AS sentence_count,
+        0 AS has_affection,
+        1 AS has_seductive,
+        1 AS has_exclusivity,
+        0 AS has_novelty,
+        1 AS has_soft_cta,
+        1 AS has_hard_cta,
+        0 AS has_question,
+        1 AS has_personal_address,
+        1 AS has_time_reference,
+        5 AS total_feature_count
+      FROM slot_candidates
+    )
+  ) p4 ON TRUE
+),
+
+enhanced_scoring AS (
+  SELECT
+    *,
+
+    -- Calculate predicted revenue
+    predicted_view_rate * predicted_conversion_rate * price_numeric AS predicted_base_revenue,
+
+    -- Recency multiplier (encourages proper spacing)
+    CASE
+      WHEN hours_since_last >= 12 THEN 1.2
+      WHEN hours_since_last >= 8 THEN 1.0
+      WHEN hours_since_last >= 4 THEN 0.8
+      WHEN hours_since_last >= 2 THEN 0.6
+      ELSE 0.3
+    END AS recency_multiplier,
+
+    -- Creator tier multiplier
+    CASE creator_tier
+      WHEN 'PLATINUM' THEN 1.3
+      WHEN 'GOLD' THEN 1.1
+      WHEN 'SILVER' THEN 1.0
+      ELSE 0.8
+    END AS tier_multiplier,
+
+    -- Time period multiplier (peak hours bonus)
+    CASE
+      WHEN send_hour BETWEEN 19 AND 23 THEN 1.2  -- Prime evening
+      WHEN send_hour BETWEEN 12 AND 18 THEN 1.0  -- Afternoon
+      WHEN send_hour BETWEEN 9 AND 11 THEN 0.9   -- Late morning
+      ELSE 0.7  -- Off-peak
+    END AS time_period_multiplier
+
+  FROM ml_predictions
+),
+
+final_scoring AS (
+  SELECT
+    creator_name,
+    slot_time,
+    send_hour,
+    send_dow,
+
+    -- Raw ML predictions
+    ROUND(predicted_view_rate, 4) AS predicted_view_rate,
+    ROUND(predicted_conversion_rate, 4) AS predicted_conversion_rate,
+    ROUND(predicted_base_revenue, 2) AS predicted_base_revenue,
+
+    -- ML confidence scores
+    ROUND(optimal_timing_probability, 3) AS timing_confidence,
+    ROUND(content_performance_probability, 3) AS content_confidence,
+
+    -- Multipliers
+    recency_multiplier,
+    tier_multiplier,
+    time_period_multiplier,
+
+    -- Final ML-enhanced score
+    ROUND(
+      predicted_base_revenue *
+      recency_multiplier *
+      tier_multiplier *
+      time_period_multiplier *
+      optimal_timing_probability *
+      content_performance_probability
+    , 2) AS ml_enhanced_score,
+
+    -- Metadata
+    hours_since_last,
+    creator_tier,
+    hour_offset,
+
+    -- Human-readable timing
+    FORMAT_TIMESTAMP('%A %I:%M %p', slot_time) AS slot_display,
+    TIMESTAMP_DIFF(slot_time, CURRENT_TIMESTAMP(), MINUTE) AS minutes_until
+
+  FROM enhanced_scoring
+),
+
+ranked_recommendations AS (
+  SELECT
+    *,
+
+    -- Global ranking across all creators
+    ROW_NUMBER() OVER (ORDER BY ml_enhanced_score DESC) AS global_rank,
+
+    -- Per-creator ranking
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_name
+      ORDER BY ml_enhanced_score DESC
+    ) AS creator_rank,
+
+    -- Per-hour ranking (for capacity planning)
+    ROW_NUMBER() OVER (
+      PARTITION BY send_hour
+      ORDER BY ml_enhanced_score DESC
+    ) AS hour_rank,
+
+    -- Recommendation quality
+    CASE
+      WHEN ml_enhanced_score > 50 THEN 'EXCELLENT'
+      WHEN ml_enhanced_score > 30 THEN 'GOOD'
+      WHEN ml_enhanced_score > 15 THEN 'FAIR'
+      ELSE 'POOR'
+    END AS recommendation_quality,
+
+    -- Confidence level
+    CASE
+      WHEN timing_confidence > 0.7 AND content_confidence > 0.7 THEN 'HIGH'
+      WHEN timing_confidence > 0.5 AND content_confidence > 0.5 THEN 'MEDIUM'
+      ELSE 'LOW'
+    END AS prediction_confidence
+
+  FROM final_scoring
+)
+
+SELECT
+  creator_name,
+  slot_time,
+  slot_display,
+  minutes_until,
+
+  -- Core ML predictions
+  predicted_view_rate,
+  predicted_conversion_rate,
+  predicted_base_revenue,
+
+  -- Enhanced scoring
+  ml_enhanced_score,
+  recommendation_quality,
+  prediction_confidence,
+
+  -- Rankings
+  global_rank,
+  creator_rank,
+  hour_rank,
+
+  -- Timing analysis
+  timing_confidence,
+  content_confidence,
+  hours_since_last,
+
+  -- Multipliers for transparency
+  recency_multiplier,
+  tier_multiplier,
+  time_period_multiplier,
+
+  -- Action guidance
+  CASE
+    WHEN recommendation_quality = 'EXCELLENT' AND prediction_confidence = 'HIGH'
+    THEN 'STRONGLY RECOMMENDED'
+    WHEN recommendation_quality IN ('EXCELLENT', 'GOOD') AND prediction_confidence IN ('HIGH', 'MEDIUM')
+    THEN 'RECOMMENDED'
+    WHEN recommendation_quality = 'FAIR'
+    THEN 'CONSIDER'
+    ELSE 'NOT RECOMMENDED'
+  END AS action_guidance,
+
+  -- Context
+  creator_tier,
+  send_hour,
+  send_dow
+
+FROM ranked_recommendations
+WHERE creator_rank <= 10  -- Top 10 slots per creator
+ORDER BY ml_enhanced_score DESC
+;
+
+-- Materialized table for high-performance serving
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+CLUSTER BY (creator_name, global_rank)
+AS
+SELECT
+  CURRENT_TIMESTAMP() AS generated_at,
+  *
+FROM `of-scheduler-proj.layer_04_ml.v_next24_ml_slot_recommendations`
+WHERE global_rank <= 1000  -- Top 1000 global recommendations
+;
+
+-- Scheduler interface view with simplified output
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_scheduler_next24_recommendations` AS
+SELECT
+  creator_name,
+  slot_display AS recommended_time,
+  ROUND(ml_enhanced_score, 0) AS score,
+  recommendation_quality AS quality,
+  action_guidance AS recommendation,
+
+  -- Key metrics for scheduler decision
+  CONCAT(
+    'View Rate: ', ROUND(predicted_view_rate * 100, 1), '% | ',
+    'Conversion: ', ROUND(predicted_conversion_rate * 100, 1), '% | ',
+    'Revenue: $', ROUND(predicted_base_revenue, 0)
+  ) AS prediction_summary,
+
+  -- Timing context
+  CASE
+    WHEN hours_since_last < 4 THEN CONCAT('⚠️ Only ', hours_since_last, 'h since last message')
+    WHEN hours_since_last >= 12 THEN '✅ Optimal spacing'
+    ELSE CONCAT('✓ ', hours_since_last, 'h spacing')
+  END AS timing_status,
+
+  -- Confidence indicator
+  CASE prediction_confidence
+    WHEN 'HIGH' THEN '🎯 High Confidence'
+    WHEN 'MEDIUM' THEN '📊 Medium Confidence'
+    ELSE '❓ Low Confidence'
+  END AS confidence_display,
+
+  -- For scheduler interface pagination
+  creator_rank,
+  global_rank,
+  slot_time,
+  generated_at
+
+FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+WHERE creator_rank <= 5  -- Top 5 per creator for scheduler UI
+ORDER BY creator_name, creator_rank
+;
+
+-- Batch prediction refresh procedure
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_04_ml.sp_refresh_next24_ml_recommendations`()
+BEGIN
+
+  -- Refresh the materialized recommendations table
+  CREATE OR REPLACE TABLE `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+  CLUSTER BY (creator_name, global_rank)
+  AS
+  SELECT
+    CURRENT_TIMESTAMP() AS generated_at,
+    *
+  FROM `of-scheduler-proj.layer_04_ml.v_next24_ml_slot_recommendations`
+  WHERE global_rank <= 1000
+  ;
+
+  -- Log the refresh
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.ml_refresh_log` (
+    refresh_timestamp,
+    table_name,
+    total_recommendations,
+    avg_ml_score,
+    high_quality_count
+  )
+  SELECT
+    CURRENT_TIMESTAMP(),
+    'next24_ml_recommendations_latest',
+    COUNT(*),
+    AVG(ml_enhanced_score),
+    COUNTIF(recommendation_quality = 'EXCELLENT')
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+  ;
+
+END;
+
+-- Performance monitoring view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_ml_recommendation_metrics` AS
+WITH daily_performance AS (
+  SELECT
+    DATE(generated_at) AS prediction_date,
+    COUNT(*) AS total_recommendations,
+    AVG(ml_enhanced_score) AS avg_ml_score,
+    COUNTIF(recommendation_quality = 'EXCELLENT') AS excellent_count,
+    COUNTIF(prediction_confidence = 'HIGH') AS high_confidence_count,
+
+    -- Score distribution
+    COUNTIF(ml_enhanced_score > 50) AS high_score_count,
+    COUNTIF(ml_enhanced_score BETWEEN 30 AND 50) AS medium_score_count,
+    COUNTIF(ml_enhanced_score < 30) AS low_score_count,
+
+    -- Creator coverage
+    COUNT(DISTINCT creator_name) AS unique_creators
+
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+  GROUP BY prediction_date
+)
+
+SELECT
+  prediction_date,
+  total_recommendations,
+  ROUND(avg_ml_score, 2) AS avg_ml_score,
+  excellent_count,
+  high_confidence_count,
+  unique_creators,
+
+  -- Quality percentages
+  ROUND(excellent_count / total_recommendations * 100, 1) AS excellent_percentage,
+  ROUND(high_confidence_count / total_recommendations * 100, 1) AS high_confidence_percentage,
+
+  -- Score distribution
+  CONCAT(
+    'High: ', high_score_count, ' (',
+    ROUND(high_score_count / total_recommendations * 100, 1), '%) | ',
+    'Medium: ', medium_score_count, ' (',
+    ROUND(medium_score_count / total_recommendations * 100, 1), '%) | ',
+    'Low: ', low_score_count, ' (',
+    ROUND(low_score_count / total_recommendations * 100, 1), '%)'
+  ) AS score_distribution
+
+FROM daily_performance
+ORDER BY prediction_date DESC
+;

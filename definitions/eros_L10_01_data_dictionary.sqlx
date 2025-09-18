@@ -1,0 +1,626 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L10", "data_dictionary"],
+  dependencies: ["eros_L9_01_retention_and_options"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L10.01: Comprehensive Data Dictionary and Documentation
+-- ================================================================
+-- Self-documenting system with metadata, lineage, and usage tracking
+-- Provides comprehensive documentation for all system components
+-- ================================================================
+
+-- Data dictionary table for all system objects
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_10_documentation.data_dictionary` (
+  object_id STRING NOT NULL,
+  object_type STRING NOT NULL,  -- TABLE, VIEW, PROCEDURE, FUNCTION, DATASET
+  object_name STRING NOT NULL,
+  dataset_name STRING NOT NULL,
+  layer_name STRING NOT NULL,   -- L0, L1, L2, etc.
+  object_description STRING,
+  business_purpose STRING,
+  data_source STRING,
+  update_frequency STRING,
+  data_freshness_sla STRING,
+  owner_team STRING,
+  technical_contact STRING,
+  business_contact STRING,
+  tags ARRAY<STRING>,
+  compliance_requirements ARRAY<STRING>,
+  created_date DATE,
+  last_modified_date DATE,
+  deprecation_date DATE,
+  is_active BOOL DEFAULT true,
+  documentation_last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  documentation_updated_by STRING DEFAULT SESSION_USER()
+)
+CLUSTER BY (layer_name, object_type)
+;
+
+-- Column-level documentation
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_10_documentation.column_dictionary` (
+  column_id STRING NOT NULL,
+  object_id STRING NOT NULL,  -- References data_dictionary.object_id
+  column_name STRING NOT NULL,
+  column_position INT64,
+  data_type STRING NOT NULL,
+  is_nullable BOOL,
+  is_primary_key BOOL DEFAULT false,
+  is_foreign_key BOOL DEFAULT false,
+  foreign_key_reference STRING,
+  column_description STRING,
+  business_definition STRING,
+  data_format STRING,
+  valid_values STRING,
+  example_values ARRAY<STRING>,
+  data_classification STRING,  -- PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+  pii_type STRING,  -- NAME, EMAIL, PHONE, SSN, etc.
+  created_date DATE,
+  last_modified_date DATE,
+  is_active BOOL DEFAULT true
+)
+CLUSTER BY (object_id, column_position)
+;
+
+-- Data lineage tracking
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_10_documentation.data_lineage` (
+  lineage_id STRING NOT NULL,
+  source_object_id STRING NOT NULL,
+  target_object_id STRING NOT NULL,
+  lineage_type STRING NOT NULL,  -- DIRECT, TRANSFORMATION, AGGREGATION, JOIN
+  transformation_logic STRING,
+  dependency_strength STRING DEFAULT 'MEDIUM',  -- HIGH, MEDIUM, LOW
+  is_active BOOL DEFAULT true,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING DEFAULT SESSION_USER()
+)
+CLUSTER BY (source_object_id, target_object_id)
+;
+
+-- Usage analytics and query patterns
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_10_documentation.usage_analytics` (
+  usage_date DATE NOT NULL,
+  object_id STRING NOT NULL,
+  query_count INT64 DEFAULT 0,
+  unique_users INT64 DEFAULT 0,
+  total_bytes_processed INT64 DEFAULT 0,
+  avg_query_duration_seconds FLOAT64,
+  most_common_query_pattern STRING,
+  peak_usage_hour INT64,
+  usage_trend STRING,  -- INCREASING, STABLE, DECREASING
+  last_accessed TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+PARTITION BY usage_date
+CLUSTER BY (object_id, usage_date)
+;
+
+-- Initialize data dictionary with system tables
+INSERT INTO `of-scheduler-proj.layer_10_documentation.data_dictionary` (
+  object_id,
+  object_type,
+  object_name,
+  dataset_name,
+  layer_name,
+  object_description,
+  business_purpose,
+  data_source,
+  update_frequency,
+  data_freshness_sla,
+  owner_team,
+  technical_contact,
+  business_contact,
+  tags,
+  compliance_requirements,
+  created_date
+) VALUES
+  -- L0 Core Tables
+  ('OBJ_001', 'TABLE', 'mass_message_master', 'layer_00_ingestion', 'L0',
+   'Master table containing all message data with performance metrics',
+   'Central repository for all OnlyFans message data and engagement metrics',
+   'Gmail ETL pipeline, manual CSV uploads',
+   'Continuous (hourly incremental)',
+   '< 4 hours',
+   'Data Engineering',
+   'engineering@company.com',
+   'operations@company.com',
+   ['core_data', 'messages', 'performance'],
+   ['GDPR', 'SOX', 'DATA_RETENTION'],
+   '2024-01-01'),
+
+  ('OBJ_002', 'TABLE', 'mass_message_incoming_stage', 'layer_00_ingestion', 'L0',
+   'Staging table for incoming message data before processing',
+   'Temporary storage for raw message data during ETL processing',
+   'Gmail ETL pipeline',
+   'Continuous',
+   '< 1 hour',
+   'Data Engineering',
+   'engineering@company.com',
+   'operations@company.com',
+   ['staging', 'etl', 'raw_data'],
+   ['DATA_QUALITY'],
+   '2024-01-01'),
+
+  -- L1 Semantic Views
+  ('OBJ_003', 'VIEW', 'v_message_facts_by_page', 'layer_01_semantic', 'L1',
+   'Semantic view providing creator-level performance analytics',
+   'Business intelligence view for creator performance monitoring and optimization',
+   'of-scheduler-proj.layer_00_ingestion.mass_message_master',
+   'Real-time (based on source)',
+   '< 4 hours',
+   'Analytics Team',
+   'analytics@company.com',
+   'business@company.com',
+   ['analytics', 'creator_performance', 'kpis'],
+   ['BUSINESS_METRICS'],
+   '2024-01-01'),
+
+  -- L2 Feature Engineering
+  ('OBJ_004', 'VIEW', 'v_next24_feature_bundle', 'layer_02_features', 'L2',
+   'Feature bundle for next 24-hour scheduling recommendations',
+   'ML feature engineering for intelligent message timing optimization',
+   'layer_01_semantic.v_message_facts_by_page',
+   'Hourly',
+   '< 2 hours',
+   'ML Engineering',
+   'ml-team@company.com',
+   'schedulers@company.com',
+   ['ml_features', 'scheduling', 'optimization'],
+   ['ML_GOVERNANCE'],
+   '2024-01-01'),
+
+  -- L3 Decision Engine
+  ('OBJ_005', 'TABLE', 'operations_config', 'layer_03_decisions', 'L3',
+   'Configuration table for operational decision rules and A/B testing',
+   'Controls business rules, scheduling policies, and experimentation framework',
+   'Manual configuration, A/B test results',
+   'As needed (configuration changes)',
+   'Immediate',
+   'Operations Team',
+   'operations@company.com',
+   'business@company.com',
+   ['configuration', 'ab_testing', 'business_rules'],
+   ['CHANGE_MANAGEMENT'],
+   '2024-01-01'),
+
+  -- L4 ML Models
+  ('OBJ_006', 'TABLE', 'next24_ml_recommendations_latest', 'layer_04_ml', 'L4',
+   'Latest ML-generated recommendations for message scheduling',
+   'AI-powered scheduling recommendations for optimal creator performance',
+   'BigQuery ML models, Vertex AI predictions',
+   'Hourly',
+   '< 1 hour',
+   'ML Engineering',
+   'ml-team@company.com',
+   'schedulers@company.com',
+   ['ml_predictions', 'recommendations', 'ai'],
+   ['ML_GOVERNANCE', 'MODEL_MONITORING'],
+   '2024-01-01'),
+
+  -- L5 Serving Layer
+  ('OBJ_007', 'VIEW', 'v_scheduler_interface_next24', 'layer_05_ml', 'L5',
+   'Real-time serving view for scheduler application interfaces',
+   'High-performance interface for scheduler tools and dashboards',
+   'layer_04_ml.next24_ml_recommendations_latest',
+   'Real-time',
+   '< 5 minutes',
+   'Product Engineering',
+   'product@company.com',
+   'schedulers@company.com',
+   ['serving_layer', 'real_time', 'scheduler_ui'],
+   ['PERFORMANCE_SLA'],
+   '2024-01-01'),
+
+  -- L6 Monitoring
+  ('OBJ_008', 'TABLE', 'alert_history', 'layer_06_monitoring', 'L6',
+   'Historical record of all system alerts and their resolution',
+   'System monitoring and alerting for operational excellence',
+   'Automated monitoring, alert detection rules',
+   'Continuous',
+   'Real-time',
+   'SRE Team',
+   'sre@company.com',
+   'operations@company.com',
+   ['monitoring', 'alerts', 'sre'],
+   ['INCIDENT_MANAGEMENT'],
+   '2024-01-01'),
+
+  -- L7 Security
+  ('OBJ_009', 'TABLE', 'data_access_log', 'layer_07_security', 'L7',
+   'Audit log of all data access and security events',
+   'Security monitoring and compliance auditing',
+   'BigQuery audit logs, application access logs',
+   'Continuous',
+   'Real-time',
+   'Security Team',
+   'security@company.com',
+   'compliance@company.com',
+   ['security', 'audit', 'compliance'],
+   ['GDPR', 'SOX', 'SECURITY_AUDIT'],
+   '2024-01-01')
+;
+
+-- Initialize column documentation for key tables
+INSERT INTO `of-scheduler-proj.layer_10_documentation.column_dictionary` (
+  column_id,
+  object_id,
+  column_name,
+  column_position,
+  data_type,
+  is_nullable,
+  column_description,
+  business_definition,
+  data_classification,
+  pii_type,
+  example_values,
+  created_date
+) VALUES
+  -- mass_message_master columns
+  ('COL_001', 'OBJ_001', 'message_id', 1, 'STRING', false,
+   'Unique identifier for each message',
+   'Primary key for message records, used for deduplication and tracking',
+   'INTERNAL', NULL,
+   ['msg_12345_67890', 'msg_98765_43210'],
+   '2024-01-01'),
+
+  ('COL_002', 'OBJ_001', 'message', 2, 'STRING', true,
+   'Full text content of the message sent to fans',
+   'The actual message content sent through OnlyFans platform',
+   'CONFIDENTIAL', 'CONTENT',
+   ['Hey baby! Check out my new content 💋', 'Special offer just for you...'],
+   '2024-01-01'),
+
+  ('COL_003', 'OBJ_001', 'sender', 3, 'STRING', false,
+   'Creator/page name who sent the message',
+   'Identifies which creator or OnlyFans page sent the message',
+   'CONFIDENTIAL', 'CREATOR_NAME',
+   ['creator_sarah', 'model_jessica'],
+   '2024-01-01'),
+
+  ('COL_004', 'OBJ_001', 'sending_time', 4, 'TIMESTAMP', false,
+   'Timestamp when the message was sent',
+   'UTC timestamp of when the message was dispatched on OnlyFans',
+   'INTERNAL', NULL,
+   ['2024-01-15 19:30:00 UTC', '2024-01-15 14:22:15 UTC'],
+   '2024-01-01'),
+
+  ('COL_005', 'OBJ_001', 'sent', 5, 'INT64', true,
+   'Number of fans who received the message',
+   'Total count of fans who received this message in their inbox',
+   'INTERNAL', NULL,
+   ['1250', '890', '2100'],
+   '2024-01-01'),
+
+  ('COL_006', 'OBJ_001', 'viewed', 6, 'INT64', true,
+   'Number of fans who opened/viewed the message',
+   'Count of unique fans who opened and viewed the message content',
+   'INTERNAL', NULL,
+   ['125', '78', '245'],
+   '2024-01-01'),
+
+  ('COL_007', 'OBJ_001', 'purchased', 7, 'INT64', true,
+   'Number of fans who made a purchase from this message',
+   'Count of fans who completed a purchase/tip after viewing the message',
+   'CONFIDENTIAL', NULL,
+   ['15', '8', '32'],
+   '2024-01-01'),
+
+  ('COL_008', 'OBJ_001', 'earnings', 8, 'FLOAT64', true,
+   'Total revenue generated from this message in USD',
+   'Total earnings in USD from all purchases/tips resulting from this message',
+   'RESTRICTED', 'FINANCIAL',
+   ['75.50', '120.00', '245.75'],
+   '2024-01-01'),
+
+  ('COL_009', 'OBJ_001', 'price', 9, 'STRING', true,
+   'Price point mentioned in the message',
+   'The price point or cost mentioned in the message content',
+   'CONFIDENTIAL', NULL,
+   ['$5', '$15', '$25'],
+   '2024-01-01'),
+
+  ('COL_010', 'OBJ_001', 'loaded_at', 10, 'TIMESTAMP', false,
+   'Timestamp when this record was loaded into the system',
+   'ETL timestamp for data lineage and freshness tracking',
+   'INTERNAL', NULL,
+   ['2024-01-15 20:05:30 UTC'],
+   '2024-01-01')
+;
+
+-- Initialize data lineage relationships
+INSERT INTO `of-scheduler-proj.layer_10_documentation.data_lineage` (
+  lineage_id,
+  source_object_id,
+  target_object_id,
+  lineage_type,
+  transformation_logic,
+  dependency_strength,
+  created_by
+) VALUES
+  ('LIN_001', 'OBJ_002', 'OBJ_001', 'TRANSFORMATION',
+   'ETL processing with deduplication, validation, and ML feature generation',
+   'HIGH', 'system_init'),
+
+  ('LIN_002', 'OBJ_001', 'OBJ_003', 'AGGREGATION',
+   'Creator-level aggregation with performance metrics calculation',
+   'HIGH', 'system_init'),
+
+  ('LIN_003', 'OBJ_003', 'OBJ_004', 'TRANSFORMATION',
+   'Feature engineering for ML models including timing, recency, and performance features',
+   'HIGH', 'system_init'),
+
+  ('LIN_004', 'OBJ_004', 'OBJ_006', 'TRANSFORMATION',
+   'ML model predictions and scoring using BigQuery ML and Vertex AI',
+   'HIGH', 'system_init'),
+
+  ('LIN_005', 'OBJ_006', 'OBJ_007', 'DIRECT',
+   'Real-time serving view with UI-optimized formatting',
+   'HIGH', 'system_init'),
+
+  ('LIN_006', 'OBJ_001', 'OBJ_008', 'DIRECT',
+   'System monitoring based on data quality and performance metrics',
+   'MEDIUM', 'system_init')
+;
+
+-- System documentation and metadata views
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_10_documentation.v_system_overview` AS
+WITH layer_summary AS (
+  SELECT
+    layer_name,
+    COUNT(*) AS total_objects,
+    COUNTIF(object_type = 'TABLE') AS tables,
+    COUNTIF(object_type = 'VIEW') AS views,
+    COUNTIF(object_type = 'PROCEDURE') AS procedures,
+    COUNTIF(object_type = 'FUNCTION') AS functions,
+    COUNTIF(is_active) AS active_objects,
+    STRING_AGG(DISTINCT owner_team ORDER BY owner_team) AS teams,
+    MAX(last_modified_date) AS most_recent_change
+  FROM `of-scheduler-proj.layer_10_documentation.data_dictionary`
+  GROUP BY layer_name
+),
+
+compliance_summary AS (
+  SELECT
+    compliance_req,
+    COUNT(DISTINCT object_id) AS affected_objects
+  FROM `of-scheduler-proj.layer_10_documentation.data_dictionary`,
+  UNNEST(compliance_requirements) AS compliance_req
+  GROUP BY compliance_req
+),
+
+data_classification_summary AS (
+  SELECT
+    data_classification,
+    COUNT(*) AS column_count,
+    COUNT(DISTINCT object_id) AS table_count
+  FROM `of-scheduler-proj.layer_10_documentation.column_dictionary`
+  WHERE data_classification IS NOT NULL
+  GROUP BY data_classification
+)
+
+SELECT
+  CURRENT_TIMESTAMP() AS report_timestamp,
+
+  -- Layer breakdown
+  ARRAY(
+    SELECT AS STRUCT
+      layer_name,
+      total_objects,
+      tables,
+      views,
+      procedures + functions AS executable_objects,
+      active_objects,
+      teams AS owner_teams,
+      most_recent_change
+    FROM layer_summary
+    ORDER BY layer_name
+  ) AS layer_breakdown,
+
+  -- Compliance overview
+  ARRAY(
+    SELECT AS STRUCT
+      compliance_req AS requirement,
+      affected_objects
+    FROM compliance_summary
+    ORDER BY affected_objects DESC
+  ) AS compliance_requirements,
+
+  -- Data classification
+  ARRAY(
+    SELECT AS STRUCT
+      data_classification AS classification_level,
+      column_count,
+      table_count
+    FROM data_classification_summary
+    ORDER BY
+      CASE data_classification
+        WHEN 'RESTRICTED' THEN 1
+        WHEN 'CONFIDENTIAL' THEN 2
+        WHEN 'INTERNAL' THEN 3
+        WHEN 'PUBLIC' THEN 4
+        ELSE 5
+      END
+  ) AS data_classification_summary,
+
+  -- System metrics
+  (SELECT COUNT(*) FROM `of-scheduler-proj.layer_10_documentation.data_dictionary`) AS total_documented_objects,
+  (SELECT COUNT(*) FROM `of-scheduler-proj.layer_10_documentation.column_dictionary`) AS total_documented_columns,
+  (SELECT COUNT(*) FROM `of-scheduler-proj.layer_10_documentation.data_lineage`) AS total_lineage_relationships,
+
+  -- Documentation health
+  (SELECT
+    ROUND(COUNTIF(object_description IS NOT NULL) / COUNT(*) * 100, 1)
+   FROM `of-scheduler-proj.layer_10_documentation.data_dictionary`) AS object_description_coverage_percent,
+
+  (SELECT
+    ROUND(COUNTIF(column_description IS NOT NULL) / COUNT(*) * 100, 1)
+   FROM `of-scheduler-proj.layer_10_documentation.column_dictionary`) AS column_description_coverage_percent
+;
+
+-- Data lineage visualization view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_10_documentation.v_data_lineage_map` AS
+WITH lineage_graph AS (
+  SELECT
+    l.lineage_id,
+    l.lineage_type,
+    l.dependency_strength,
+
+    -- Source object details
+    s.object_name AS source_object,
+    s.dataset_name AS source_dataset,
+    s.layer_name AS source_layer,
+    s.object_type AS source_type,
+
+    -- Target object details
+    t.object_name AS target_object,
+    t.dataset_name AS target_dataset,
+    t.layer_name AS target_layer,
+    t.object_type AS target_type,
+
+    -- Transformation info
+    l.transformation_logic,
+
+    -- Layer flow (numeric for ordering)
+    CASE s.layer_name
+      WHEN 'L0' THEN 0 WHEN 'L1' THEN 1 WHEN 'L2' THEN 2 WHEN 'L3' THEN 3 WHEN 'L4' THEN 4
+      WHEN 'L5' THEN 5 WHEN 'L6' THEN 6 WHEN 'L7' THEN 7 WHEN 'L8' THEN 8 WHEN 'L9' THEN 9
+      WHEN 'L10' THEN 10 ELSE 99
+    END AS source_layer_order,
+
+    CASE t.layer_name
+      WHEN 'L0' THEN 0 WHEN 'L1' THEN 1 WHEN 'L2' THEN 2 WHEN 'L3' THEN 3 WHEN 'L4' THEN 4
+      WHEN 'L5' THEN 5 WHEN 'L6' THEN 6 WHEN 'L7' THEN 7 WHEN 'L8' THEN 8 WHEN 'L9' THEN 9
+      WHEN 'L10' THEN 10 ELSE 99
+    END AS target_layer_order
+
+  FROM `of-scheduler-proj.layer_10_documentation.data_lineage` l
+  JOIN `of-scheduler-proj.layer_10_documentation.data_dictionary` s
+    ON l.source_object_id = s.object_id
+  JOIN `of-scheduler-proj.layer_10_documentation.data_dictionary` t
+    ON l.target_object_id = t.object_id
+  WHERE l.is_active = true
+)
+
+SELECT
+  source_layer,
+  source_dataset,
+  source_object,
+  source_type,
+  target_layer,
+  target_dataset,
+  target_object,
+  target_type,
+  lineage_type,
+  dependency_strength,
+  transformation_logic,
+
+  -- Flow description
+  CONCAT(
+    source_layer, '.', source_dataset, '.', source_object,
+    ' → ',
+    target_layer, '.', target_dataset, '.', target_object
+  ) AS data_flow,
+
+  -- Complexity indicator
+  CASE
+    WHEN transformation_logic IS NULL THEN 'SIMPLE'
+    WHEN LENGTH(transformation_logic) > 200 THEN 'COMPLEX'
+    ELSE 'MODERATE'
+  END AS transformation_complexity,
+
+  -- Cross-layer indicator
+  CASE
+    WHEN source_layer_order = target_layer_order THEN 'INTRA_LAYER'
+    WHEN target_layer_order = source_layer_order + 1 THEN 'SEQUENTIAL'
+    WHEN target_layer_order > source_layer_order + 1 THEN 'SKIP_LAYER'
+    ELSE 'REVERSE_FLOW'
+  END AS flow_pattern
+
+FROM lineage_graph
+ORDER BY source_layer_order, target_layer_order, source_object, target_object
+;
+
+-- Usage analytics summary
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_10_documentation.v_usage_analytics_summary` AS
+WITH recent_usage AS (
+  SELECT
+    u.object_id,
+    d.object_name,
+    d.dataset_name,
+    d.layer_name,
+    d.object_type,
+
+    -- Recent usage metrics (last 30 days)
+    SUM(u.query_count) AS total_queries_30d,
+    AVG(u.query_count) AS avg_daily_queries,
+    SUM(u.unique_users) AS total_unique_users_30d,
+    SUM(u.total_bytes_processed) AS total_bytes_processed_30d,
+    AVG(u.avg_query_duration_seconds) AS avg_query_duration_seconds,
+
+    -- Usage patterns
+    MAX(u.last_accessed) AS last_accessed,
+    MODE() OVER (PARTITION BY u.object_id) AS most_common_usage_pattern,
+
+    -- Trend analysis
+    CASE
+      WHEN AVG(CASE WHEN u.usage_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN u.query_count END) >
+           AVG(CASE WHEN u.usage_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+                                          AND DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN u.query_count END) * 1.2
+      THEN 'INCREASING'
+      WHEN AVG(CASE WHEN u.usage_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN u.query_count END) <
+           AVG(CASE WHEN u.usage_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+                                          AND DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN u.query_count END) * 0.8
+      THEN 'DECREASING'
+      ELSE 'STABLE'
+    END AS usage_trend
+
+  FROM `of-scheduler-proj.layer_10_documentation.usage_analytics` u
+  JOIN `of-scheduler-proj.layer_10_documentation.data_dictionary` d
+    ON u.object_id = d.object_id
+  WHERE u.usage_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  GROUP BY u.object_id, d.object_name, d.dataset_name, d.layer_name, d.object_type
+)
+
+SELECT
+  object_name,
+  dataset_name,
+  layer_name,
+  object_type,
+
+  -- Usage metrics
+  total_queries_30d,
+  ROUND(avg_daily_queries, 1) AS avg_daily_queries,
+  total_unique_users_30d,
+
+  -- Performance metrics
+  ROUND(total_bytes_processed_30d / (1024*1024*1024), 2) AS total_gb_processed_30d,
+  ROUND(avg_query_duration_seconds, 2) AS avg_query_duration_seconds,
+
+  -- Timing
+  last_accessed,
+  DATE_DIFF(CURRENT_DATE(), DATE(last_accessed), DAY) AS days_since_last_access,
+
+  -- Usage classification
+  CASE
+    WHEN total_queries_30d > 1000 THEN 'HIGH_USAGE'
+    WHEN total_queries_30d > 100 THEN 'MEDIUM_USAGE'
+    WHEN total_queries_30d > 10 THEN 'LOW_USAGE'
+    WHEN total_queries_30d > 0 THEN 'MINIMAL_USAGE'
+    ELSE 'UNUSED'
+  END AS usage_classification,
+
+  usage_trend,
+
+  -- Performance indicators
+  CASE
+    WHEN avg_query_duration_seconds > 60 THEN '🔴 SLOW'
+    WHEN avg_query_duration_seconds > 10 THEN '🟡 MODERATE'
+    ELSE '🟢 FAST'
+  END AS performance_indicator
+
+FROM recent_usage
+ORDER BY total_queries_30d DESC, layer_name, object_name
+;

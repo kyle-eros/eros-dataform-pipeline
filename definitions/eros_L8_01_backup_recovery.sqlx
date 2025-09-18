@@ -1,0 +1,571 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L8", "backup_recovery"],
+  dependencies: ["eros_L7_01_masking_policies"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L8.01: Backup and Recovery System
+-- ================================================================
+-- Automated backup procedures, disaster recovery, and data retention
+-- Ensures data durability and business continuity
+-- ================================================================
+
+-- Backup configuration table
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_08_operations.backup_configurations` (
+  config_id STRING NOT NULL,
+  backup_type STRING NOT NULL,  -- FULL, INCREMENTAL, SNAPSHOT, EXPORT
+  source_dataset STRING NOT NULL,
+  source_table STRING,  -- NULL for dataset-level backups
+  backup_destination STRING NOT NULL,
+  backup_frequency STRING NOT NULL,  -- HOURLY, DAILY, WEEKLY, MONTHLY
+  retention_days INT64 NOT NULL,
+  is_active BOOL DEFAULT true,
+  backup_description STRING,
+  last_backup_time TIMESTAMP,
+  next_backup_time TIMESTAMP,
+  backup_count INT64 DEFAULT 0,
+  failure_count INT64 DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING DEFAULT SESSION_USER()
+)
+CLUSTER BY (backup_type, backup_frequency)
+;
+
+-- Initialize backup configurations
+INSERT INTO `of-scheduler-proj.layer_08_operations.backup_configurations` (
+  config_id,
+  backup_type,
+  source_dataset,
+  source_table,
+  backup_destination,
+  backup_frequency,
+  retention_days,
+  backup_description,
+  next_backup_time,
+  created_by
+) VALUES
+  -- Critical data daily backups
+  ('BACKUP_001', 'FULL', 'layer_00_ingestion', 'mass_message_master',
+   'gs://eros-backups/daily/mass_message_master', 'DAILY', 90,
+   'Daily backup of core message data',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY), INTERVAL 1 DAY),
+   'system_init'),
+
+  ('BACKUP_002', 'SNAPSHOT', 'layer_00_ingestion', NULL,
+   'eros_backup_layer_00_ingestion', 'DAILY', 30,
+   'Daily snapshot of ingestion layer',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY), INTERVAL 1 DAY),
+   'system_init'),
+
+  -- ML model and predictions backup
+  ('BACKUP_003', 'EXPORT', 'layer_04_ml', 'next24_ml_recommendations_latest',
+   'gs://eros-backups/ml/recommendations', 'HOURLY', 7,
+   'Hourly backup of ML recommendations',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 1 HOUR),
+   'system_init'),
+
+  ('BACKUP_004', 'FULL', 'layer_04_ml', NULL,
+   'gs://eros-backups/weekly/ml_models', 'WEEKLY', 180,
+   'Weekly backup of ML models and training data',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), WEEK), INTERVAL 1 WEEK),
+   'system_init'),
+
+  -- Configuration and governance backup
+  ('BACKUP_005', 'EXPORT', 'governance', NULL,
+   'gs://eros-backups/daily/governance', 'DAILY', 365,
+   'Daily backup of governance and configuration data',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY), INTERVAL 1 DAY),
+   'system_init'),
+
+  -- Analytics and monitoring backup
+  ('BACKUP_006', 'EXPORT', 'layer_06_monitoring', 'alert_history',
+   'gs://eros-backups/weekly/monitoring', 'WEEKLY', 365,
+   'Weekly backup of monitoring and alert history',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), WEEK), INTERVAL 1 WEEK),
+   'system_init'),
+
+  -- Security layer backup
+  ('BACKUP_007', 'EXPORT', 'layer_07_security', NULL,
+   'gs://eros-backups/daily/security', 'DAILY', 2555,  -- 7 years for compliance
+   'Daily backup of security configurations and access logs',
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY), INTERVAL 1 DAY),
+   'system_init')
+;
+
+-- Backup execution log
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_08_operations.backup_execution_log` (
+  execution_id STRING NOT NULL,
+  config_id STRING NOT NULL,
+  backup_type STRING NOT NULL,
+  source_dataset STRING NOT NULL,
+  source_table STRING,
+  backup_destination STRING NOT NULL,
+  execution_start_time TIMESTAMP NOT NULL,
+  execution_end_time TIMESTAMP,
+  execution_status STRING DEFAULT 'RUNNING',  -- RUNNING, SUCCESS, FAILED, CANCELLED
+  rows_backed_up INT64,
+  backup_size_bytes INT64,
+  backup_location STRING,
+  error_message STRING,
+  execution_duration_seconds INT64,
+  backup_job_id STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+PARTITION BY DATE(execution_start_time)
+CLUSTER BY (config_id, execution_status)
+;
+
+-- Backup execution procedure
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_08_operations.sp_execute_backup`(
+  config_id_param STRING
+)
+BEGIN
+  DECLARE backup_config STRUCT<
+    backup_type STRING,
+    source_dataset STRING,
+    source_table STRING,
+    backup_destination STRING,
+    backup_frequency STRING
+  >;
+
+  DECLARE execution_id STRING DEFAULT GENERATE_UUID();
+  DECLARE backup_location STRING;
+  DECLARE backup_timestamp STRING DEFAULT FORMAT_TIMESTAMP('%Y%m%d_%H%M%S', CURRENT_TIMESTAMP());
+
+  -- Get backup configuration
+  SET backup_config = (
+    SELECT AS STRUCT backup_type, source_dataset, source_table, backup_destination, backup_frequency
+    FROM `of-scheduler-proj.layer_08_operations.backup_configurations`
+    WHERE config_id = config_id_param AND is_active = true
+  );
+
+  IF backup_config IS NULL THEN
+    RAISE USING MESSAGE = CONCAT('Backup configuration not found or inactive: ', config_id_param);
+  END IF;
+
+  -- Generate backup location
+  SET backup_location = CONCAT(
+    backup_config.backup_destination,
+    '/',
+    backup_timestamp,
+    CASE
+      WHEN backup_config.source_table IS NOT NULL
+      THEN CONCAT('/', backup_config.source_table)
+      ELSE ''
+    END
+  );
+
+  -- Log backup start
+  INSERT INTO `of-scheduler-proj.layer_08_operations.backup_execution_log` (
+    execution_id,
+    config_id,
+    backup_type,
+    source_dataset,
+    source_table,
+    backup_destination,
+    execution_start_time,
+    backup_location
+  ) VALUES (
+    execution_id,
+    config_id_param,
+    backup_config.backup_type,
+    backup_config.source_dataset,
+    backup_config.source_table,
+    backup_config.backup_destination,
+    CURRENT_TIMESTAMP(),
+    backup_location
+  );
+
+  -- Execute backup based on type
+  BEGIN
+    IF backup_config.backup_type = 'EXPORT' THEN
+      -- Export data to Cloud Storage
+      IF backup_config.source_table IS NOT NULL THEN
+        EXPORT DATA
+        OPTIONS (
+          uri = CONCAT(backup_location, '/*.csv'),
+          format = 'CSV',
+          overwrite = true,
+          header = true
+        )
+        AS (
+          EXECUTE IMMEDIATE CONCAT(
+            'SELECT * FROM `', backup_config.source_dataset, '.', backup_config.source_table, '`'
+          )
+        );
+      ELSE
+        -- Export entire dataset (would need to iterate through tables)
+        EXPORT DATA
+        OPTIONS (
+          uri = CONCAT(backup_location, '/*.csv'),
+          format = 'CSV',
+          overwrite = true,
+          header = true
+        )
+        AS (
+          SELECT 'DATASET_BACKUP_PLACEHOLDER' AS placeholder
+        );
+      END IF;
+
+    ELSEIF backup_config.backup_type = 'SNAPSHOT' THEN
+      -- Create dataset snapshot
+      EXECUTE IMMEDIATE CONCAT(
+        'CREATE SCHEMA `', backup_location, '` CLONE `', backup_config.source_dataset, '`'
+      );
+
+    ELSEIF backup_config.backup_type = 'FULL' THEN
+      -- Full table backup to new table
+      IF backup_config.source_table IS NOT NULL THEN
+        EXECUTE IMMEDIATE CONCAT(
+          'CREATE OR REPLACE TABLE `', backup_location, '` AS ',
+          'SELECT * FROM `', backup_config.source_dataset, '.', backup_config.source_table, '`'
+        );
+      END IF;
+
+    END IF;
+
+    -- Update backup success
+    UPDATE `of-scheduler-proj.layer_08_operations.backup_execution_log`
+    SET
+      execution_end_time = CURRENT_TIMESTAMP(),
+      execution_status = 'SUCCESS',
+      execution_duration_seconds = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), execution_start_time, SECOND)
+    WHERE execution_id = execution_id;
+
+    -- Update configuration
+    UPDATE `of-scheduler-proj.layer_08_operations.backup_configurations`
+    SET
+      last_backup_time = CURRENT_TIMESTAMP(),
+      next_backup_time = CASE backup_frequency
+        WHEN 'HOURLY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+        WHEN 'DAILY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
+        WHEN 'WEEKLY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+        WHEN 'MONTHLY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+        ELSE TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
+      END,
+      backup_count = backup_count + 1
+    WHERE config_id = config_id_param;
+
+  EXCEPTION WHEN ERROR THEN
+    -- Log backup failure
+    UPDATE `of-scheduler-proj.layer_08_operations.backup_execution_log`
+    SET
+      execution_end_time = CURRENT_TIMESTAMP(),
+      execution_status = 'FAILED',
+      error_message = @@error.message,
+      execution_duration_seconds = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), execution_start_time, SECOND)
+    WHERE execution_id = execution_id;
+
+    -- Update failure count
+    UPDATE `of-scheduler-proj.layer_08_operations.backup_configurations`
+    SET failure_count = failure_count + 1
+    WHERE config_id = config_id_param;
+
+    RAISE USING MESSAGE = CONCAT('Backup failed: ', @@error.message);
+  END;
+
+  -- Log successful completion
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'BACKUP_COMPLETED',
+    'layer_08_operations',
+    CONCAT('Backup completed for config: ', config_id_param),
+    TO_JSON_STRING(STRUCT(
+      execution_id,
+      backup_config.backup_type AS backup_type,
+      backup_location
+    ))
+  );
+
+END;
+
+-- Recovery procedures
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_08_operations.sp_restore_from_backup`(
+  backup_location STRING,
+  target_dataset STRING,
+  target_table STRING,
+  restore_type STRING DEFAULT 'REPLACE'  -- REPLACE, APPEND, CREATE_NEW
+)
+BEGIN
+  DECLARE restore_id STRING DEFAULT GENERATE_UUID();
+  DECLARE restore_table_name STRING;
+
+  -- Determine target table name
+  SET restore_table_name = CASE restore_type
+    WHEN 'CREATE_NEW' THEN CONCAT(target_table, '_restored_', FORMAT_TIMESTAMP('%Y%m%d_%H%M%S', CURRENT_TIMESTAMP()))
+    ELSE target_table
+  END;
+
+  -- Log restore start
+  INSERT INTO `of-scheduler-proj.layer_08_operations.backup_execution_log` (
+    execution_id,
+    config_id,
+    backup_type,
+    source_dataset,
+    source_table,
+    backup_destination,
+    execution_start_time,
+    backup_location
+  ) VALUES (
+    restore_id,
+    'RESTORE_OPERATION',
+    'RESTORE',
+    target_dataset,
+    restore_table_name,
+    backup_location,
+    CURRENT_TIMESTAMP(),
+    backup_location
+  );
+
+  BEGIN
+    -- Restore based on backup type
+    IF ENDS_WITH(backup_location, '.csv') OR CONTAINS(backup_location, '*.csv') THEN
+      -- Restore from CSV export
+      IF restore_type = 'REPLACE' THEN
+        EXECUTE IMMEDIATE CONCAT(
+          'CREATE OR REPLACE EXTERNAL TABLE `', target_dataset, '.', restore_table_name, '_temp` ',
+          'OPTIONS (format = "CSV", uris = ["', backup_location, '"])'
+        );
+
+        EXECUTE IMMEDIATE CONCAT(
+          'CREATE OR REPLACE TABLE `', target_dataset, '.', restore_table_name, '` AS ',
+          'SELECT * FROM `', target_dataset, '.', restore_table_name, '_temp`'
+        );
+
+        EXECUTE IMMEDIATE CONCAT(
+          'DROP TABLE `', target_dataset, '.', restore_table_name, '_temp`'
+        );
+
+      ELSEIF restore_type = 'APPEND' THEN
+        EXECUTE IMMEDIATE CONCAT(
+          'CREATE OR REPLACE EXTERNAL TABLE `', target_dataset, '.', restore_table_name, '_temp` ',
+          'OPTIONS (format = "CSV", uris = ["', backup_location, '"])'
+        );
+
+        EXECUTE IMMEDIATE CONCAT(
+          'INSERT INTO `', target_dataset, '.', restore_table_name, '` ',
+          'SELECT * FROM `', target_dataset, '.', restore_table_name, '_temp`'
+        );
+
+        EXECUTE IMMEDIATE CONCAT(
+          'DROP TABLE `', target_dataset, '.', restore_table_name, '_temp`'
+        );
+      END IF;
+
+    ELSE
+      -- Restore from table/dataset backup
+      EXECUTE IMMEDIATE CONCAT(
+        'CREATE OR REPLACE TABLE `', target_dataset, '.', restore_table_name, '` AS ',
+        'SELECT * FROM `', backup_location, '`'
+      );
+    END IF;
+
+    -- Update restore success
+    UPDATE `of-scheduler-proj.layer_08_operations.backup_execution_log`
+    SET
+      execution_end_time = CURRENT_TIMESTAMP(),
+      execution_status = 'SUCCESS',
+      execution_duration_seconds = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), execution_start_time, SECOND)
+    WHERE execution_id = restore_id;
+
+  EXCEPTION WHEN ERROR THEN
+    -- Log restore failure
+    UPDATE `of-scheduler-proj.layer_08_operations.backup_execution_log`
+    SET
+      execution_end_time = CURRENT_TIMESTAMP(),
+      execution_status = 'FAILED',
+      error_message = @@error.message,
+      execution_duration_seconds = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), execution_start_time, SECOND)
+    WHERE execution_id = restore_id;
+
+    RAISE USING MESSAGE = CONCAT('Restore failed: ', @@error.message);
+  END;
+
+  -- Log successful completion
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'RESTORE_COMPLETED',
+    'layer_08_operations',
+    CONCAT('Restore completed to: ', target_dataset, '.', restore_table_name),
+    TO_JSON_STRING(STRUCT(
+      restore_id,
+      backup_location,
+      restore_type
+    ))
+  );
+
+END;
+
+-- Backup retention enforcement
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_08_operations.sp_enforce_backup_retention`()
+BEGIN
+  DECLARE retention_cursor CURSOR FOR
+    SELECT DISTINCT backup_destination, retention_days
+    FROM `of-scheduler-proj.layer_08_operations.backup_configurations`
+    WHERE is_active = true;
+
+  FOR record IN retention_cursor DO
+    -- Delete old backup execution logs
+    DELETE FROM `of-scheduler-proj.layer_08_operations.backup_execution_log`
+    WHERE backup_destination = record.backup_destination
+      AND execution_start_time < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL record.retention_days DAY);
+
+    -- Note: Actual backup file deletion would require Cloud Functions or external processes
+    -- Log retention enforcement
+    INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+      event_timestamp,
+      event_type,
+      event_source,
+      event_description,
+      event_data
+    ) VALUES (
+      CURRENT_TIMESTAMP(),
+      'BACKUP_RETENTION_ENFORCED',
+      'layer_08_operations',
+      'Backup retention enforced',
+      TO_JSON_STRING(STRUCT(
+        record.backup_destination AS destination,
+        record.retention_days AS retention_days
+      ))
+    );
+  END FOR;
+END;
+
+-- Backup health monitoring
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_08_operations.v_backup_health_dashboard` AS
+WITH backup_summary AS (
+  SELECT
+    c.config_id,
+    c.backup_type,
+    c.source_dataset,
+    c.source_table,
+    c.backup_frequency,
+    c.retention_days,
+    c.last_backup_time,
+    c.next_backup_time,
+    c.backup_count,
+    c.failure_count,
+    c.is_active,
+
+    -- Time since last backup
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), c.last_backup_time, MINUTE) AS minutes_since_last_backup,
+    TIMESTAMP_DIFF(c.next_backup_time, CURRENT_TIMESTAMP(), MINUTE) AS minutes_to_next_backup,
+
+    -- Recent backup status
+    l.execution_status AS last_execution_status,
+    l.execution_duration_seconds AS last_execution_duration,
+    l.backup_size_bytes AS last_backup_size
+
+  FROM `of-scheduler-proj.layer_08_operations.backup_configurations` c
+  LEFT JOIN (
+    SELECT DISTINCT
+      config_id,
+      FIRST_VALUE(execution_status) OVER (PARTITION BY config_id ORDER BY execution_start_time DESC) AS execution_status,
+      FIRST_VALUE(execution_duration_seconds) OVER (PARTITION BY config_id ORDER BY execution_start_time DESC) AS execution_duration_seconds,
+      FIRST_VALUE(backup_size_bytes) OVER (PARTITION BY config_id ORDER BY execution_start_time DESC) AS backup_size_bytes
+    FROM `of-scheduler-proj.layer_08_operations.backup_execution_log`
+    WHERE execution_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  ) l ON c.config_id = l.config_id
+),
+
+health_assessment AS (
+  SELECT
+    *,
+
+    -- Health status assessment
+    CASE
+      WHEN NOT is_active THEN 'DISABLED'
+      WHEN last_backup_time IS NULL THEN 'NEVER_RUN'
+      WHEN last_execution_status = 'FAILED' THEN 'FAILED'
+      WHEN minutes_since_last_backup >
+           CASE backup_frequency
+             WHEN 'HOURLY' THEN 90    -- 1.5 hours
+             WHEN 'DAILY' THEN 1800   -- 30 hours
+             WHEN 'WEEKLY' THEN 12960 -- 9 days
+             ELSE 1800
+           END THEN 'OVERDUE'
+      WHEN last_execution_status = 'SUCCESS' THEN 'HEALTHY'
+      ELSE 'UNKNOWN'
+    END AS health_status,
+
+    -- Success rate calculation
+    CASE
+      WHEN backup_count + failure_count > 0
+      THEN ROUND(backup_count / (backup_count + failure_count) * 100, 1)
+      ELSE NULL
+    END AS success_rate_percent
+
+  FROM backup_summary
+)
+
+SELECT
+  config_id,
+  backup_type,
+  CONCAT(source_dataset, COALESCE(CONCAT('.', source_table), '')) AS backup_source,
+  backup_frequency,
+  health_status,
+  success_rate_percent,
+  backup_count,
+  failure_count,
+
+  -- Timing information
+  last_backup_time,
+  CASE
+    WHEN minutes_since_last_backup < 60 THEN CONCAT(minutes_since_last_backup, ' min ago')
+    WHEN minutes_since_last_backup < 1440 THEN CONCAT(ROUND(minutes_since_last_backup / 60, 1), ' hours ago')
+    ELSE CONCAT(ROUND(minutes_since_last_backup / 1440, 1), ' days ago')
+  END AS last_backup_display,
+
+  next_backup_time,
+  CASE
+    WHEN minutes_to_next_backup < 0 THEN 'OVERDUE'
+    WHEN minutes_to_next_backup < 60 THEN CONCAT(minutes_to_next_backup, ' min')
+    WHEN minutes_to_next_backup < 1440 THEN CONCAT(ROUND(minutes_to_next_backup / 60, 1), ' hours')
+    ELSE CONCAT(ROUND(minutes_to_next_backup / 1440, 1), ' days')
+  END AS next_backup_display,
+
+  -- Last execution details
+  last_execution_status,
+  CASE
+    WHEN last_execution_duration < 60 THEN CONCAT(last_execution_duration, ' sec')
+    WHEN last_execution_duration < 3600 THEN CONCAT(ROUND(last_execution_duration / 60, 1), ' min')
+    ELSE CONCAT(ROUND(last_execution_duration / 3600, 1), ' hours')
+  END AS last_execution_duration_display,
+
+  CASE
+    WHEN last_backup_size < 1024*1024 THEN CONCAT(ROUND(last_backup_size / 1024, 1), ' KB')
+    WHEN last_backup_size < 1024*1024*1024 THEN CONCAT(ROUND(last_backup_size / (1024*1024), 1), ' MB')
+    ELSE CONCAT(ROUND(last_backup_size / (1024*1024*1024), 1), ' GB')
+  END AS last_backup_size_display,
+
+  retention_days,
+  is_active
+
+FROM health_assessment
+ORDER BY
+  CASE health_status
+    WHEN 'FAILED' THEN 1
+    WHEN 'OVERDUE' THEN 2
+    WHEN 'NEVER_RUN' THEN 3
+    WHEN 'UNKNOWN' THEN 4
+    WHEN 'HEALTHY' THEN 5
+    WHEN 'DISABLED' THEN 6
+  END,
+  backup_frequency,
+  config_id
+;

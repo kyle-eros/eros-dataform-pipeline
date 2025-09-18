@@ -1,0 +1,420 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L4", "models"],
+  dependencies: ["eros_L3_01_ops_config", "eros_L3_02_next24"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L4.02: BigQuery ML Models and Vertex AI Integration
+-- ================================================================
+-- Creates ML models for performance prediction and optimization
+-- Integrates with Vertex AI for advanced ML capabilities
+-- ================================================================
+
+-- Model 1: Message Performance Prediction
+CREATE OR REPLACE MODEL `of-scheduler-proj.layer_04_ml.model_message_performance`
+OPTIONS (
+  model_type = 'BOOSTED_TREE_REGRESSOR',
+  input_label_cols = ['view_rate'],
+  max_iterations = 100,
+  learn_rate = 0.1,
+  subsample = 0.8,
+  auto_class_weights = true
+) AS
+SELECT
+  send_hour,
+  send_dow,
+  send_day,
+  message_length,
+  word_count,
+  has_price_mention,
+  has_urgency,
+  has_emoji,
+  creator_avg_view_rate_30d,
+  creator_avg_conversion_rate_30d,
+  hour_deviation_from_avg,
+  price_numeric,
+  view_rate
+
+FROM `of-scheduler-proj.layer_04_ml.v_training_message_performance`
+WHERE
+  is_complete_record = 1
+  AND view_rate IS NOT NULL
+  AND view_rate >= 0
+  AND view_rate <= 1
+;
+
+-- Model 2: Conversion Rate Prediction
+CREATE OR REPLACE MODEL `of-scheduler-proj.layer_04_ml.model_conversion_rate`
+OPTIONS (
+  model_type = 'BOOSTED_TREE_REGRESSOR',
+  input_label_cols = ['conversion_rate'],
+  max_iterations = 100,
+  learn_rate = 0.1,
+  subsample = 0.8
+) AS
+SELECT
+  send_hour,
+  send_dow,
+  message_length,
+  word_count,
+  has_price_mention,
+  has_urgency,
+  has_emoji,
+  creator_avg_view_rate_30d,
+  creator_avg_conversion_rate_30d,
+  price_numeric,
+  conversion_rate
+
+FROM `of-scheduler-proj.layer_04_ml.v_training_message_performance`
+WHERE
+  is_complete_record = 1
+  AND conversion_rate IS NOT NULL
+  AND conversion_rate >= 0
+  AND conversion_rate <= 1
+;
+
+-- Model 3: Optimal Timing Classification
+CREATE OR REPLACE MODEL `of-scheduler-proj.layer_04_ml.model_optimal_timing`
+OPTIONS (
+  model_type = 'BOOSTED_TREE_CLASSIFIER',
+  input_label_cols = ['is_best_revenue_hour'],
+  max_iterations = 50,
+  learn_rate = 0.15,
+  auto_class_weights = true
+) AS
+SELECT
+  send_hour,
+  send_dow,
+  hour_cos,
+  hour_sin,
+  is_sunday,
+  is_saturday,
+  is_weekday,
+  avg_view_rate,
+  avg_conversion_rate,
+  revenue_ratio_vs_day_avg,
+  view_rate_ratio_vs_day_avg,
+  is_best_revenue_hour
+
+FROM `of-scheduler-proj.layer_04_ml.v_training_optimal_timing`
+WHERE is_best_revenue_hour IS NOT NULL
+;
+
+-- Model 4: Content Performance Classification
+CREATE OR REPLACE MODEL `of-scheduler-proj.layer_04_ml.model_content_performance`
+OPTIONS (
+  model_type = 'BOOSTED_TREE_CLASSIFIER',
+  input_label_cols = ['is_high_revenue'],
+  max_iterations = 75,
+  learn_rate = 0.1,
+  auto_class_weights = true
+) AS
+SELECT
+  char_count,
+  word_count,
+  sentence_count,
+  has_affection,
+  has_seductive,
+  has_exclusivity,
+  has_novelty,
+  has_soft_cta,
+  has_hard_cta,
+  has_question,
+  has_personal_address,
+  has_time_reference,
+  total_feature_count,
+  is_high_revenue
+
+FROM `of-scheduler-proj.layer_04_ml.v_training_content_features`
+WHERE is_high_revenue IS NOT NULL
+;
+
+-- Vertex AI Remote Model for Gemini Content Generation
+CREATE OR REPLACE MODEL `of-scheduler-proj.layer_04_ml.model_gemini_content_generator`
+REMOTE WITH CONNECTION `of-scheduler-proj.us-central1.vertex-ai-connection`
+OPTIONS (
+  ENDPOINT = 'https://us-central1-aiplatform.googleapis.com/v1/projects/of-scheduler-proj/locations/us-central1/publishers/google/models/gemini-1.5-flash'
+);
+
+-- Enhanced prediction views with ML model integration
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_ml_message_predictions` AS
+WITH ml_predictions AS (
+  SELECT
+    f.*,
+
+    -- View rate prediction
+    p1.predicted_view_rate,
+    p1.predicted_view_rate_confidence,
+
+    -- Conversion rate prediction
+    p2.predicted_conversion_rate,
+    p2.predicted_conversion_rate_confidence,
+
+    -- Expected revenue calculation
+    f.sent * p1.predicted_view_rate * p2.predicted_conversion_rate *
+    COALESCE(f.price_numeric, 15.0) AS predicted_revenue
+
+  FROM `of-scheduler-proj.layer_02_features.v_next24_feature_bundle` f
+
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_message_performance`,
+    (
+      SELECT
+        send_hour,
+        send_dow,
+        send_day,
+        message_length,
+        word_count,
+        has_price_mention,
+        has_urgency,
+        has_emoji,
+        creator_avg_view_rate_30d,
+        creator_avg_conversion_rate_30d,
+        hour_deviation_from_avg,
+        price_numeric
+      FROM `of-scheduler-proj.layer_02_features.v_next24_feature_bundle`
+    )
+  ) p1 ON TRUE
+
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_conversion_rate`,
+    (
+      SELECT
+        send_hour,
+        send_dow,
+        message_length,
+        word_count,
+        has_price_mention,
+        has_urgency,
+        has_emoji,
+        creator_avg_view_rate_30d,
+        creator_avg_conversion_rate_30d,
+        price_numeric
+      FROM `of-scheduler-proj.layer_02_features.v_next24_feature_bundle`
+    )
+  ) p2 ON TRUE
+)
+
+SELECT
+  *,
+
+  -- ML-enhanced slot score
+  `of-scheduler-proj.layer_02_features.udf_slot_score_v2`(
+    timing_score,
+    recency_score,
+    novelty_score,
+    price_signal_score,
+
+    -- Use ML predictions to enhance scoring
+    CASE
+      WHEN predicted_view_rate > 0.15 THEN 0.9
+      WHEN predicted_view_rate > 0.10 THEN 0.7
+      WHEN predicted_view_rate > 0.05 THEN 0.5
+      ELSE 0.3
+    END,
+
+    CASE
+      WHEN predicted_conversion_rate > 0.08 THEN 0.9
+      WHEN predicted_conversion_rate > 0.05 THEN 0.7
+      WHEN predicted_conversion_rate > 0.03 THEN 0.5
+      ELSE 0.3
+    END
+  ) AS ml_enhanced_slot_score,
+
+  -- Confidence metrics
+  CASE
+    WHEN predicted_view_rate_confidence > 0.8 AND predicted_conversion_rate_confidence > 0.8
+    THEN 'HIGH'
+    WHEN predicted_view_rate_confidence > 0.6 AND predicted_conversion_rate_confidence > 0.6
+    THEN 'MEDIUM'
+    ELSE 'LOW'
+  END AS prediction_confidence,
+
+  -- Revenue tier based on predictions
+  CASE
+    WHEN predicted_revenue > 500 THEN 'PLATINUM'
+    WHEN predicted_revenue > 200 THEN 'GOLD'
+    WHEN predicted_revenue > 100 THEN 'SILVER'
+    ELSE 'BRONZE'
+  END AS predicted_revenue_tier
+
+FROM ml_predictions
+;
+
+-- Optimal timing recommendations using ML
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_ml_timing_recommendations` AS
+WITH timing_predictions AS (
+  SELECT
+    h.creator_name,
+    h.candidate_hour,
+    h.candidate_dow,
+    h.hour_cos,
+    h.hour_sin,
+    h.is_sunday,
+    h.is_saturday,
+    h.is_weekday,
+    h.historical_avg_view_rate,
+    h.historical_avg_conversion_rate,
+    h.revenue_ratio_vs_day_avg,
+    h.view_rate_ratio_vs_day_avg,
+
+    -- ML prediction for optimal timing
+    p.predicted_is_best_revenue_hour,
+    p.predicted_is_best_revenue_hour_probs[OFFSET(0)].prob AS optimal_probability
+
+  FROM `of-scheduler-proj.layer_02_features.v_timing_candidates` h
+
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_optimal_timing`,
+    (
+      SELECT
+        candidate_hour AS send_hour,
+        candidate_dow AS send_dow,
+        hour_cos,
+        hour_sin,
+        is_sunday,
+        is_saturday,
+        is_weekday,
+        historical_avg_view_rate AS avg_view_rate,
+        historical_avg_conversion_rate AS avg_conversion_rate,
+        revenue_ratio_vs_day_avg,
+        view_rate_ratio_vs_day_avg
+      FROM `of-scheduler-proj.layer_02_features.v_timing_candidates`
+    )
+  ) p ON TRUE
+),
+
+ranked_recommendations AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_name, candidate_dow
+      ORDER BY optimal_probability DESC
+    ) AS timing_rank,
+
+    CASE
+      WHEN optimal_probability > 0.7 THEN 'EXCELLENT'
+      WHEN optimal_probability > 0.5 THEN 'GOOD'
+      WHEN optimal_probability > 0.3 THEN 'FAIR'
+      ELSE 'POOR'
+    END AS timing_quality
+
+  FROM timing_predictions
+)
+
+SELECT
+  creator_name,
+  candidate_hour AS recommended_hour,
+  candidate_dow AS day_of_week,
+  optimal_probability,
+  timing_quality,
+  timing_rank,
+
+  -- Human-readable timing recommendation
+  CASE candidate_dow
+    WHEN 1 THEN 'Sunday'
+    WHEN 2 THEN 'Monday'
+    WHEN 3 THEN 'Tuesday'
+    WHEN 4 THEN 'Wednesday'
+    WHEN 5 THEN 'Thursday'
+    WHEN 6 THEN 'Friday'
+    WHEN 7 THEN 'Saturday'
+  END AS day_name,
+
+  CASE
+    WHEN candidate_hour = 0 THEN '12:00 AM'
+    WHEN candidate_hour < 12 THEN CONCAT(CAST(candidate_hour AS STRING), ':00 AM')
+    WHEN candidate_hour = 12 THEN '12:00 PM'
+    ELSE CONCAT(CAST(candidate_hour - 12 AS STRING), ':00 PM')
+  END AS time_display
+
+FROM ranked_recommendations
+WHERE timing_rank <= 3  -- Top 3 recommendations per creator per day
+ORDER BY creator_name, candidate_dow, timing_rank
+;
+
+-- Stored procedure for batch ML predictions
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_04_ml.sp_generate_ml_predictions`(
+  prediction_timestamp TIMESTAMP
+)
+BEGIN
+
+  -- Update ML predictions for next 24 hours
+  CREATE OR REPLACE TABLE `of-scheduler-proj.layer_04_ml.ml_predictions_latest` AS
+  SELECT
+    prediction_timestamp,
+    creator_name,
+    candidate_slot_time,
+    ml_enhanced_slot_score,
+    predicted_view_rate,
+    predicted_conversion_rate,
+    predicted_revenue,
+    predicted_revenue_tier,
+    prediction_confidence,
+
+    -- Rank candidates by ML score
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_name
+      ORDER BY ml_enhanced_slot_score DESC
+    ) AS ml_score_rank
+
+  FROM `of-scheduler-proj.layer_04_ml.v_ml_message_predictions`
+  WHERE candidate_slot_time BETWEEN prediction_timestamp
+    AND TIMESTAMP_ADD(prediction_timestamp, INTERVAL 24 HOUR)
+  ;
+
+  -- Log prediction run
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.ml_prediction_log` (
+    prediction_timestamp,
+    total_predictions,
+    high_confidence_predictions,
+    avg_predicted_revenue
+  )
+  SELECT
+    prediction_timestamp,
+    COUNT(*) AS total_predictions,
+    COUNTIF(prediction_confidence = 'HIGH') AS high_confidence_predictions,
+    AVG(predicted_revenue) AS avg_predicted_revenue
+  FROM `of-scheduler-proj.layer_04_ml.ml_predictions_latest`
+  ;
+
+END;
+
+-- Model evaluation and monitoring
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_model_performance_metrics` AS
+WITH actual_vs_predicted AS (
+  SELECT
+    DATE(sending_time) AS prediction_date,
+
+    -- Actual performance
+    CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END AS actual_view_rate,
+    CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END AS actual_conversion_rate,
+    earnings / GREATEST(sent, 1) AS actual_revenue_per_message,
+
+    -- Would need to join with stored predictions for comparison
+    -- This is a framework for model monitoring
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND sent > 0
+)
+
+SELECT
+  prediction_date,
+  COUNT(*) AS total_messages,
+  AVG(actual_view_rate) AS avg_actual_view_rate,
+  AVG(actual_conversion_rate) AS avg_actual_conversion_rate,
+  AVG(actual_revenue_per_message) AS avg_actual_revenue,
+
+  -- Standard deviations for performance tracking
+  STDDEV(actual_view_rate) AS stddev_view_rate,
+  STDDEV(actual_conversion_rate) AS stddev_conversion_rate,
+  STDDEV(actual_revenue_per_message) AS stddev_revenue
+
+FROM actual_vs_predicted
+GROUP BY prediction_date
+ORDER BY prediction_date DESC
+;

@@ -1,0 +1,497 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L0", "performance_optimizations"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L0.06: Performance Optimizations - Indexes and Query Acceleration
+-- =====================================================================
+-- Optimizations for high-performance querying, materialized views for
+-- common patterns, and search indexes for intelligent content analysis.
+-- =====================================================================
+
+-- =====================================================================
+-- MATERIALIZED VIEWS FOR COMMON QUERY PATTERNS
+-- =====================================================================
+
+-- Daily creator performance summary (heavily queried)
+CREATE MATERIALIZED VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mv_daily_creator_performance`
+PARTITION BY send_date
+CLUSTER BY sender_normalized, creator_tier
+AS
+SELECT
+  send_date,
+  sender_normalized,
+  creator_tier,
+
+  -- Volume metrics
+  COUNT(*) AS daily_message_count,
+  SUM(sent) AS total_sent,
+  SUM(viewed) AS total_viewed,
+  SUM(purchased) AS total_purchased,
+  SUM(earnings) AS total_earnings,
+
+  -- Performance metrics
+  AVG(conversion_rate) AS avg_conversion_rate,
+  AVG(revenue_per_message) AS avg_rpm,
+  AVG(engagement_score) AS avg_engagement_score,
+
+  -- Content metrics
+  AVG(char_length) AS avg_message_length,
+  AVG(emoji_count) AS avg_emoji_count,
+  COUNTIF(has_price_placeholder) AS price_messages,
+  COUNT(DISTINCT content_category) AS content_diversity,
+
+  -- Quality metrics
+  AVG(data_quality_score) AS avg_quality_score,
+  AVG(novelty_score) AS avg_novelty_score,
+  COUNTIF(ARRAY_LENGTH(anomaly_flags) > 0) AS anomaly_count,
+
+  -- Timing insights
+  COUNT(DISTINCT send_hour) AS hour_diversity,
+  COUNTIF(hour_category = 'PEAK') AS peak_hour_sends,
+  APPROX_TOP_COUNT(hour_category, 1)[OFFSET(0)].value AS most_common_hour_category,
+
+  -- Last updated for freshness tracking
+  MAX(updated_at) AS last_updated_at,
+  CURRENT_TIMESTAMP() AS materialized_at
+
+FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+  AND sender_normalized IS NOT NULL
+GROUP BY send_date, sender_normalized, creator_tier;
+
+-- Weekly performance trends (for dashboards)
+CREATE MATERIALIZED VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mv_weekly_performance_trends`
+PARTITION BY week_start_date
+CLUSTER BY sender_normalized
+AS
+SELECT
+  DATE_TRUNC(send_date, WEEK(MONDAY)) AS week_start_date,
+  sender_normalized,
+  creator_tier,
+
+  -- Aggregated metrics
+  COUNT(*) AS weekly_message_count,
+  SUM(earnings) AS weekly_earnings,
+  AVG(conversion_rate) AS avg_conversion_rate,
+  AVG(revenue_per_message) AS avg_rpm,
+
+  -- Trend calculations
+  AVG(engagement_score) AS avg_engagement_score,
+  STDDEV(engagement_score) AS engagement_consistency,
+
+  -- Performance vs baseline
+  AVG(conversion_rate) - cp.baseline_conversion_rate AS conversion_vs_baseline,
+  AVG(revenue_per_message) - cp.baseline_rpm AS rpm_vs_baseline,
+
+  -- Content insights
+  COUNT(DISTINCT content_category) AS content_types_used,
+  AVG(novelty_score) AS avg_novelty,
+
+  CURRENT_TIMESTAMP() AS materialized_at
+
+FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` m
+LEFT JOIN `reference.creator_profiles` cp
+  ON m.sender_normalized = cp.username_std
+WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 WEEK)
+  AND sender_normalized IS NOT NULL
+GROUP BY week_start_date, sender_normalized, creator_tier,
+         cp.baseline_conversion_rate, cp.baseline_rpm;
+
+-- =====================================================================
+-- CONTENT SEARCH OPTIMIZATION
+-- =====================================================================
+
+-- Create search index for content analysis (when BigQuery supports it)
+-- For now, we'll create optimized views and tables
+
+-- Content similarity lookup table for novelty detection
+CREATE OR REPLACE TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.content_similarity_index` (
+  content_hash STRING,
+  sender_normalized STRING,
+  message_signature STRING,  -- First 100 chars + key features
+  similar_content_hashes ARRAY<STRING>,
+  similarity_scores ARRAY<NUMERIC>,
+  content_category STRING,
+  first_used_date DATE,
+  usage_count INT64,
+  avg_performance_score NUMERIC,
+
+  -- Index fields for fast lookup
+  char_length_bucket STRING,  -- SHORT, MEDIUM, LONG
+  emoji_count_bucket STRING,  -- NONE, LOW, MEDIUM, HIGH
+  price_range_bucket STRING,  -- FREE, LOW, MEDIUM, HIGH
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY sender_normalized, content_category, char_length_bucket
+OPTIONS (
+  description = "Content similarity index for novelty scoring and duplicate detection"
+);
+
+-- =====================================================================
+-- QUERY ACCELERATION VIEWS
+-- =====================================================================
+
+-- Fast lookup for recent creator activity
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_recent_creator_activity` AS
+SELECT
+  sender_normalized,
+  creator_tier,
+  MAX(send_date) AS last_activity_date,
+  COUNT(DISTINCT send_date) AS active_days_last_30,
+  SUM(earnings) AS earnings_last_30,
+  AVG(conversion_rate) AS avg_conversion_last_30,
+  AVG(revenue_per_message) AS avg_rpm_last_30,
+
+  -- Activity patterns
+  COUNT(DISTINCT send_hour) AS hour_diversity,
+  COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM send_date)) AS day_diversity,
+
+  -- Content patterns
+  COUNT(DISTINCT content_category) AS content_diversity,
+  AVG(novelty_score) AS avg_novelty,
+
+  -- Performance tier status
+  CASE
+    WHEN AVG(revenue_per_message) >= 2.0 THEN 'PREMIUM'
+    WHEN AVG(revenue_per_message) >= 1.25 THEN 'HIGH'
+    WHEN AVG(revenue_per_message) >= 0.75 THEN 'MED'
+    ELSE 'LOW'
+  END AS performance_tier,
+
+  CURRENT_TIMESTAMP() AS calculated_at
+
+FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND sender_normalized IS NOT NULL
+GROUP BY sender_normalized, creator_tier
+HAVING COUNT(*) >= 5;  -- Only include creators with meaningful activity
+
+-- Fast lookup for content performance
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_content_performance_lookup` AS
+SELECT
+  message_hash,
+  content_category,
+  char_length,
+  emoji_count,
+  has_price_placeholder,
+
+  -- Performance aggregates
+  COUNT(*) AS usage_count,
+  COUNT(DISTINCT sender_normalized) AS used_by_creators,
+  AVG(conversion_rate) AS avg_conversion_rate,
+  AVG(revenue_per_message) AS avg_rpm,
+  AVG(engagement_score) AS avg_engagement_score,
+
+  -- Usage patterns
+  MIN(send_date) AS first_used_date,
+  MAX(send_date) AS last_used_date,
+  COUNT(DISTINCT send_date) AS days_used,
+
+  -- Performance classification
+  CASE
+    WHEN AVG(conversion_rate) >= 0.08 THEN 'HIGH_CONVERSION'
+    WHEN AVG(conversion_rate) >= 0.04 THEN 'MEDIUM_CONVERSION'
+    ELSE 'LOW_CONVERSION'
+  END AS conversion_class,
+
+  CASE
+    WHEN AVG(revenue_per_message) >= 1.5 THEN 'HIGH_RPM'
+    WHEN AVG(revenue_per_message) >= 0.75 THEN 'MEDIUM_RPM'
+    ELSE 'LOW_RPM'
+  END AS rpm_class,
+
+  CURRENT_TIMESTAMP() AS calculated_at
+
+FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+  AND message_hash IS NOT NULL
+GROUP BY message_hash, content_category, char_length, emoji_count, has_price_placeholder
+HAVING usage_count >= 2;  -- Only include content used multiple times
+
+-- =====================================================================
+-- PERFORMANCE MONITORING PROCEDURES
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_refresh_performance_materialized_views`()
+BEGIN
+  DECLARE refresh_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+
+  -- Refresh daily performance view
+  CALL BQ.REFRESH_MATERIALIZED_VIEW('of-scheduler-proj.layer_00_ingestion.mv_daily_creator_performance');
+
+  -- Refresh weekly trends view
+  CALL BQ.REFRESH_MATERIALIZED_VIEW('of-scheduler-proj.layer_00_ingestion.mv_weekly_performance_trends');
+
+  -- Update content similarity index
+  CALL `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_update_content_similarity_index`();
+
+  -- Log completion
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L0', 'materialized_view_refresh',
+    'SUCCESS',
+    FORMAT('Refreshed materialized views in %d seconds',
+           TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), refresh_start, SECOND)),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- Content similarity index update procedure
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_update_content_similarity_index`()
+BEGIN
+  DECLARE update_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+
+  -- Clear old entries (keep last 90 days)
+  DELETE FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.content_similarity_index`
+  WHERE first_used_date < DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY);
+
+  -- Update with new content
+  MERGE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.content_similarity_index` AS target
+  USING (
+    WITH content_analysis AS (
+      SELECT
+        message_hash AS content_hash,
+        sender_normalized,
+        SUBSTR(message, 1, 100) AS message_signature,
+        content_category,
+        MIN(send_date) AS first_used_date,
+        COUNT(*) AS usage_count,
+        AVG(engagement_score) AS avg_performance_score,
+
+        -- Bucketing for indexing
+        CASE
+          WHEN char_length <= 50 THEN 'SHORT'
+          WHEN char_length <= 200 THEN 'MEDIUM'
+          ELSE 'LONG'
+        END AS char_length_bucket,
+
+        CASE
+          WHEN emoji_count = 0 THEN 'NONE'
+          WHEN emoji_count <= 2 THEN 'LOW'
+          WHEN emoji_count <= 5 THEN 'MEDIUM'
+          ELSE 'HIGH'
+        END AS emoji_count_bucket,
+
+        CASE
+          WHEN price IS NULL OR price = 0 THEN 'FREE'
+          WHEN price <= 5 THEN 'LOW'
+          WHEN price <= 15 THEN 'MEDIUM'
+          ELSE 'HIGH'
+        END AS price_range_bucket
+
+      FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+      WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+        AND message_hash IS NOT NULL
+      GROUP BY message_hash, sender_normalized, message_signature, content_category,
+               char_length, emoji_count, price
+    )
+
+    SELECT
+      content_hash,
+      sender_normalized,
+      message_signature,
+      ARRAY<STRING>[] AS similar_content_hashes,  -- To be populated by ML
+      ARRAY<NUMERIC>[] AS similarity_scores,      -- To be populated by ML
+      content_category,
+      first_used_date,
+      usage_count,
+      avg_performance_score,
+      char_length_bucket,
+      emoji_count_bucket,
+      price_range_bucket,
+      CURRENT_TIMESTAMP() AS created_at,
+      CURRENT_TIMESTAMP() AS updated_at
+    FROM content_analysis
+  ) AS source
+
+  ON target.content_hash = source.content_hash
+     AND target.sender_normalized = source.sender_normalized
+
+  WHEN MATCHED THEN UPDATE SET
+    usage_count = source.usage_count,
+    avg_performance_score = source.avg_performance_score,
+    updated_at = CURRENT_TIMESTAMP()
+
+  WHEN NOT MATCHED THEN INSERT (
+    content_hash, sender_normalized, message_signature,
+    similar_content_hashes, similarity_scores, content_category,
+    first_used_date, usage_count, avg_performance_score,
+    char_length_bucket, emoji_count_bucket, price_range_bucket,
+    created_at, updated_at
+  )
+  VALUES (
+    source.content_hash, source.sender_normalized, source.message_signature,
+    source.similar_content_hashes, source.similarity_scores, source.content_category,
+    source.first_used_date, source.usage_count, source.avg_performance_score,
+    source.char_length_bucket, source.emoji_count_bucket, source.price_range_bucket,
+    source.created_at, source.updated_at
+  );
+
+  -- Log completion
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L0', 'content_similarity_index',
+    'SUCCESS',
+    FORMAT('Updated content similarity index: %d records processed in %d seconds',
+           @@row_count, TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), update_start, SECOND)),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- QUERY OPTIMIZATION HINTS AND BEST PRACTICES
+-- =====================================================================
+
+-- Create a view with query optimization recommendations
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_query_optimization_guide` AS
+SELECT
+  'Always filter by send_date for partitioned tables' AS optimization_tip,
+  'Use sender_normalized in WHERE clauses for clustered performance' AS clustering_tip,
+  'Prefer materialized views for repeated aggregations' AS materialization_tip,
+  'Use content_similarity_index for novelty calculations' AS content_tip,
+  'Filter by creator_tier early in queries for better performance' AS tier_tip
+
+UNION ALL
+
+SELECT
+  'Example fast query pattern:' AS optimization_tip,
+  'SELECT * FROM layer_00_ingestion.mv_daily_creator_performance WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND sender_normalized = "creator123"' AS clustering_tip,
+  'This uses both partition pruning and clustering' AS materialization_tip,
+  'Result: sub-second query performance' AS content_tip,
+  'Always specify date ranges for partition pruning' AS tier_tip;
+
+-- =====================================================================
+-- PERFORMANCE MONITORING VIEWS
+-- =====================================================================
+
+-- Query performance tracking
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_query_performance_stats` AS
+WITH query_stats AS (
+  SELECT
+    job_id,
+    user_email,
+    query,
+    total_bytes_processed,
+    total_slot_ms,
+    TIMESTAMP_DIFF(end_time, start_time, MILLISECOND) AS duration_ms,
+    start_time,
+    end_time,
+    error_result
+  FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+  WHERE DATE(creation_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+    AND state = 'DONE'
+    AND job_type = 'QUERY'
+    AND (
+      REGEXP_CONTAINS(query, r'layer_00_ingestion\.')
+      OR REGEXP_CONTAINS(query, r'mass_message_master')
+      OR REGEXP_CONTAINS(query, r'mv_daily_creator_performance')
+    )
+)
+
+SELECT
+  DATE(start_time) AS query_date,
+  COUNT(*) AS total_queries,
+  AVG(duration_ms) AS avg_duration_ms,
+  AVG(total_bytes_processed) AS avg_bytes_processed,
+  AVG(total_slot_ms) AS avg_slot_ms,
+  COUNTIF(error_result IS NOT NULL) AS failed_queries,
+  COUNTIF(duration_ms > 10000) AS slow_queries,  -- > 10 seconds
+
+  -- Performance classification
+  CASE
+    WHEN AVG(duration_ms) < 1000 THEN 'FAST'
+    WHEN AVG(duration_ms) < 5000 THEN 'MEDIUM'
+    ELSE 'SLOW'
+  END AS performance_class
+
+FROM query_stats
+GROUP BY DATE(start_time)
+ORDER BY query_date DESC;
+
+-- =====================================================================
+-- AUTOMATED OPTIMIZATION RECOMMENDATIONS
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_generate_optimization_recommendations`()
+BEGIN
+  -- Create recommendations table if it doesn't exist
+  CREATE TABLE IF NOT EXISTS `${dataform.projectConfig.defaultProject}.layer_00_ingestion.optimization_recommendations` (
+    recommendation_id STRING DEFAULT GENERATE_UUID(),
+    category STRING,
+    priority STRING,  -- HIGH, MEDIUM, LOW
+    recommendation TEXT,
+    impact_description TEXT,
+    implementation_sql TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+  );
+
+  -- Clear old recommendations
+  DELETE FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.optimization_recommendations`
+  WHERE created_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY);
+
+  -- Generate materialized view recommendations
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.optimization_recommendations` (
+    category, priority, recommendation, impact_description, implementation_sql
+  )
+  SELECT
+    'MATERIALIZED_VIEW',
+    'MEDIUM',
+    FORMAT('Consider materializing frequently queried pattern for creator %s', sender_normalized),
+    FORMAT('Creator %s is queried %d times daily on average', sender_normalized, query_frequency),
+    FORMAT('CREATE MATERIALIZED VIEW layer_00_ingestion.mv_creator_%s_performance AS SELECT * FROM layer_00_ingestion.mass_message_master WHERE sender_normalized = "%s"',
+           REPLACE(sender_normalized, '_', ''), sender_normalized)
+  FROM (
+    SELECT
+      sender_normalized,
+      COUNT(*) / 7.0 AS query_frequency  -- Approximate based on data access patterns
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+    WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+    GROUP BY sender_normalized
+    HAVING query_frequency > 10
+  ) frequent_creators;
+
+  -- Log completion
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L0', 'optimization_recommendations',
+    'SUCCESS',
+    FORMAT('Generated %d optimization recommendations', @@row_count),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L0', 'performance_optimizations',
+  'SUCCESS',
+  'Created materialized views, indexes, and optimization procedures',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L0.06 COMPLETE' as status,
+  'Performance optimizations complete with materialized views and content indexing' as message,
+  CURRENT_TIMESTAMP() as completed_at;

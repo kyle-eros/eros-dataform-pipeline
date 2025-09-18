@@ -1,0 +1,5 @@
+dataformCoreVersion: "3.0.30"
+defaultProject: "of-scheduler-proj"
+defaultLocation: "US"
+defaultDataset: "eros_staging"
+defaultAssertionDataset: "eros_assertions"

@@ -1,0 +1,465 @@
+config {
+  type: "view",
+  tags: ["L1", "v_page_dim"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.06: Page Dimension - Creator Profile Intelligence
+-- =====================================================================
+-- Comprehensive creator profile analysis with performance tiers,
+-- behavioral patterns, and strategic insights for optimization.
+-- =====================================================================
+
+-- =====================================================================
+-- MAIN PAGE DIMENSION VIEW
+-- =====================================================================
+
+
+WITH creator_base_metrics AS (
+  -- Foundation metrics for each creator
+  SELECT
+    creator_username,
+    creator_tier,
+
+    -- Time range analysis
+    MIN(send_date) AS first_activity_date,
+    MAX(send_date) AS last_activity_date,
+    COUNT(DISTINCT send_date) AS total_active_days,
+    DATE_DIFF(CURRENT_DATE(), MAX(send_date), DAY) AS days_since_last_activity,
+    DATE_DIFF(MAX(send_date), MIN(send_date), DAY) + 1 AS total_days_span,
+
+    -- Volume metrics
+    COUNT(*) AS total_messages,
+    COUNT(DISTINCT message_hash) AS unique_messages,
+    COUNT(*) / GREATEST(COUNT(DISTINCT send_date), 1) AS avg_messages_per_active_day,
+
+    -- Performance aggregates
+    SUM(earnings) AS total_earnings,
+    SUM(sent) AS total_sent,
+    SUM(viewed) AS total_viewed,
+    SUM(purchased) AS total_purchased,
+
+    -- Average performance
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement_score,
+
+    -- Content characteristics
+    AVG(char_length) AS avg_message_length,
+    AVG(emoji_count) AS avg_emoji_usage,
+    AVG(novelty_score) AS avg_novelty,
+    COUNT(DISTINCT content_category) AS content_types_used,
+
+    -- Quality metrics
+    AVG(data_quality_score) AS avg_quality_score,
+    COUNTIF(performance_classification = 'HIGH_PERFORMER') AS high_performance_messages,
+    COUNTIF(performance_classification = 'POOR_PERFORMER') AS poor_performance_messages,
+
+    -- Timing patterns
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+    COUNT(DISTINCT EXTRACT(DAYOFWEEK FROM send_date)) AS day_diversity,
+    APPROX_TOP_COUNT(send_hour, 1)[OFFSET(0)].value AS preferred_send_hour,
+    APPROX_TOP_COUNT(day_category, 1)[OFFSET(0)].value AS preferred_day_category,
+
+    -- Fan intelligence context
+    MAX(estimated_fan_count) AS estimated_fan_count,
+    MAX(baseline_conversion_rate) AS baseline_conversion_rate,
+    MAX(baseline_rpm) AS baseline_rpm
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)  -- 6 months window
+  GROUP BY creator_username, creator_tier
+),
+
+performance_analysis AS (
+  -- Enhanced performance analysis and trends
+  SELECT
+    cbm.*,
+
+    -- Calculated performance metrics
+    ROUND(total_earnings / GREATEST(total_messages, 1), 4) AS earnings_per_message,
+    ROUND(total_earnings / GREATEST(estimated_fan_count, 1), 4) AS earnings_per_fan,
+    ROUND(total_purchased / GREATEST(total_viewed, 1), 4) AS overall_conversion_rate,
+    ROUND(total_viewed / GREATEST(total_sent, 1), 4) AS view_rate,
+
+    -- Performance vs baseline
+    COALESCE(avg_conversion_rate / NULLIF(baseline_conversion_rate, 0), 1.0) AS conversion_vs_baseline,
+    COALESCE(avg_rpm / NULLIF(baseline_rpm, 0), 1.0) AS rpm_vs_baseline,
+
+    -- Activity patterns
+    ROUND(total_active_days / GREATEST(total_days_span, 1), 3) AS activity_consistency,
+    ROUND(unique_messages / GREATEST(total_messages, 1), 3) AS content_diversity_ratio,
+
+    -- Performance distribution
+    ROUND(high_performance_messages / GREATEST(total_messages, 1), 3) AS high_performance_rate,
+    ROUND(poor_performance_messages / GREATEST(total_messages, 1), 3) AS poor_performance_rate,
+
+    -- Tier-specific benchmarks
+    td.min_rpm AS tier_min_rpm,
+    td.min_conversion_rate AS tier_min_conversion_rate,
+    td.max_sends_per_day AS tier_max_sends_per_day,
+    td.priority_score AS tier_priority_score,
+    td.eligible_for_premium_pricing,
+    td.ml_recommendation_weight
+
+  FROM creator_base_metrics cbm
+  LEFT JOIN `layer_01_semantic.creator_tier_definitions` td
+    ON cbm.creator_tier = td.tier_name
+),
+
+trend_analysis AS (
+  -- Analyze performance trends over time
+  SELECT
+    pa.*,
+
+    -- Recent performance (last 30 days)
+    (
+      SELECT AVG(conversion_rate)
+      FROM `layer_01_semantic.v_message_facts_by_page` recent
+      WHERE recent.creator_username = pa.creator_username
+        AND recent.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    ) AS recent_conversion_rate,
+
+    (
+      SELECT AVG(revenue_per_message)
+      FROM `layer_01_semantic.v_message_facts_by_page` recent
+      WHERE recent.creator_username = pa.creator_username
+        AND recent.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    ) AS recent_rpm,
+
+    (
+      SELECT SUM(earnings)
+      FROM `layer_01_semantic.v_message_facts_by_page` recent
+      WHERE recent.creator_username = pa.creator_username
+        AND recent.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    ) AS recent_earnings_30d,
+
+    -- Previous period (31-60 days ago)
+    (
+      SELECT AVG(conversion_rate)
+      FROM `layer_01_semantic.v_message_facts_by_page` previous
+      WHERE previous.creator_username = pa.creator_username
+        AND previous.send_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+        AND DATE_SUB(CURRENT_DATE(), INTERVAL 31 DAY)
+    ) AS previous_conversion_rate,
+
+    (
+      SELECT AVG(revenue_per_message)
+      FROM `layer_01_semantic.v_message_facts_by_page` previous
+      WHERE previous.creator_username = pa.creator_username
+        AND previous.send_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)
+        AND DATE_SUB(CURRENT_DATE(), INTERVAL 31 DAY)
+    ) AS previous_rpm,
+
+    -- Trend correlation
+    (
+      SELECT CORR(UNIX_DATE(send_date), conversion_rate)
+      FROM `layer_01_semantic.v_message_facts_by_page` trend
+      WHERE trend.creator_username = pa.creator_username
+        AND trend.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    ) AS conversion_trend_correlation,
+
+    (
+      SELECT CORR(UNIX_DATE(send_date), revenue_per_message)
+      FROM `layer_01_semantic.v_message_facts_by_page` trend
+      WHERE trend.creator_username = pa.creator_username
+        AND trend.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    ) AS rpm_trend_correlation
+
+  FROM performance_analysis pa
+),
+
+creator_classification AS (
+  -- Classify creators based on comprehensive analysis
+  SELECT
+    ta.*,
+
+    -- Calculate trend ratios
+    COALESCE(recent_conversion_rate / NULLIF(previous_conversion_rate, 0), 1.0) AS conversion_trend_ratio,
+    COALESCE(recent_rpm / NULLIF(previous_rpm, 0), 1.0) AS rpm_trend_ratio,
+
+    -- Performance tier vs current performance
+    CASE
+      WHEN avg_rpm >= 2.0 AND avg_conversion_rate >= 0.08 THEN 'PREMIUM'
+      WHEN avg_rpm >= 1.25 AND avg_conversion_rate >= 0.06 THEN 'HIGH'
+      WHEN avg_rpm >= 0.75 AND avg_conversion_rate >= 0.04 THEN 'MED'
+      WHEN avg_rpm >= 0.25 AND avg_conversion_rate >= 0.02 THEN 'LOW'
+      ELSE 'NEW'
+    END AS calculated_performance_tier,
+
+    -- Trend classification
+    CASE
+      WHEN conversion_trend_correlation >= 0.5 AND rpm_trend_correlation >= 0.5 THEN 'STRONG_UPWARD'
+      WHEN conversion_trend_correlation >= 0.2 OR rpm_trend_correlation >= 0.2 THEN 'MODERATE_UPWARD'
+      WHEN conversion_trend_correlation >= -0.2 AND rpm_trend_correlation >= -0.2 THEN 'STABLE'
+      WHEN conversion_trend_correlation >= -0.5 OR rpm_trend_correlation >= -0.5 THEN 'MODERATE_DOWNWARD'
+      ELSE 'STRONG_DOWNWARD'
+    END AS performance_trend,
+
+    -- Activity level classification
+    CASE
+      WHEN days_since_last_activity > 14 THEN 'INACTIVE'
+      WHEN days_since_last_activity > 7 THEN 'LOW_ACTIVITY'
+      WHEN avg_messages_per_active_day >= 3 THEN 'HIGH_ACTIVITY'
+      WHEN avg_messages_per_active_day >= 1.5 THEN 'MODERATE_ACTIVITY'
+      ELSE 'LOW_ACTIVITY'
+    END AS activity_level,
+
+    -- Content strategy classification
+    CASE
+      WHEN content_diversity_ratio >= 0.8 AND content_types_used >= 3 THEN 'HIGHLY_CREATIVE'
+      WHEN content_diversity_ratio >= 0.6 AND content_types_used >= 2 THEN 'MODERATELY_CREATIVE'
+      WHEN content_diversity_ratio >= 0.4 THEN 'SOMEWHAT_REPETITIVE'
+      ELSE 'HIGHLY_REPETITIVE'
+    END AS content_strategy,
+
+    -- Optimization classification
+    CASE
+      WHEN high_performance_rate >= 0.3 AND avg_novelty >= 0.7 THEN 'WELL_OPTIMIZED'
+      WHEN high_performance_rate >= 0.2 OR avg_novelty >= 0.5 THEN 'MODERATELY_OPTIMIZED'
+      WHEN poor_performance_rate <= 0.3 THEN 'NEEDS_MINOR_OPTIMIZATION'
+      ELSE 'NEEDS_MAJOR_OPTIMIZATION'
+    END AS optimization_status,
+
+    -- Risk assessment
+    CASE
+      WHEN days_since_last_activity > 14 THEN 'CHURN_RISK'
+      WHEN performance_trend = 'STRONG_DOWNWARD' THEN 'PERFORMANCE_RISK'
+      WHEN poor_performance_rate > 0.5 THEN 'QUALITY_RISK'
+      WHEN activity_consistency < 0.3 THEN 'CONSISTENCY_RISK'
+      ELSE 'LOW_RISK'
+    END AS risk_category
+
+  FROM trend_analysis ta
+),
+
+strategic_insights AS (
+  -- Generate strategic recommendations and insights
+  SELECT
+    cc.*,
+
+    -- Performance gap analysis
+    CASE
+      WHEN creator_tier != calculated_performance_tier THEN TRUE
+      ELSE FALSE
+    END AS tier_mismatch,
+
+    -- Strategic recommendations
+    CASE
+      WHEN risk_category = 'CHURN_RISK' THEN 'RE_ENGAGEMENT_CAMPAIGN'
+      WHEN performance_trend = 'STRONG_DOWNWARD' THEN 'PERFORMANCE_INTERVENTION'
+      WHEN optimization_status = 'NEEDS_MAJOR_OPTIMIZATION' THEN 'COMPREHENSIVE_OPTIMIZATION'
+      WHEN calculated_performance_tier != creator_tier AND calculated_performance_tier > creator_tier THEN 'TIER_PROMOTION'
+      WHEN content_strategy = 'HIGHLY_REPETITIVE' THEN 'CONTENT_REFRESH'
+      WHEN activity_level = 'LOW_ACTIVITY' AND avg_rpm > tier_min_rpm THEN 'INCREASE_FREQUENCY'
+      WHEN performance_trend = 'STRONG_UPWARD' THEN 'SCALE_SUCCESS_STRATEGY'
+      ELSE 'MAINTAIN_CURRENT_STRATEGY'
+    END AS primary_recommendation,
+
+    -- Opportunity areas
+    ARRAY_CONCAT(
+      CASE WHEN hour_diversity <= 3 THEN ['EXPAND_TIMING'] ELSE [] END,
+      CASE WHEN content_types_used <= 2 THEN ['DIVERSIFY_CONTENT'] ELSE [] END,
+      CASE WHEN avg_novelty < 0.4 THEN ['IMPROVE_NOVELTY'] ELSE [] END,
+      CASE WHEN conversion_vs_baseline < 0.8 THEN ['OPTIMIZE_CONVERSION'] ELSE [] END,
+      CASE WHEN rpm_vs_baseline < 0.8 THEN ['OPTIMIZE_PRICING'] ELSE [] END,
+      CASE WHEN activity_consistency < 0.5 THEN ['IMPROVE_CONSISTENCY'] ELSE [] END
+    ) AS opportunity_areas,
+
+    -- Success factors
+    ARRAY_CONCAT(
+      CASE WHEN high_performance_rate >= 0.3 THEN ['HIGH_QUALITY_CONTENT'] ELSE [] END,
+      CASE WHEN content_diversity_ratio >= 0.7 THEN ['CONTENT_VARIETY'] ELSE [] END,
+      CASE WHEN conversion_vs_baseline >= 1.2 THEN ['STRONG_CONVERSION'] ELSE [] END,
+      CASE WHEN rpm_vs_baseline >= 1.2 THEN ['STRONG_PRICING'] ELSE [] END,
+      CASE WHEN activity_consistency >= 0.8 THEN ['CONSISTENT_ACTIVITY'] ELSE [] END,
+      CASE WHEN performance_trend IN ('STRONG_UPWARD', 'MODERATE_UPWARD') THEN ['POSITIVE_MOMENTUM'] ELSE [] END
+    ) AS success_factors
+
+  FROM creator_classification cc
+)
+
+-- Main view query
+SELECT
+  creator_username,
+  creator_tier,
+  calculated_performance_tier,
+  tier_mismatch,
+
+  -- Activity summary
+  first_activity_date,
+  last_activity_date,
+  days_since_last_activity,
+  total_active_days,
+  total_days_span,
+  activity_level,
+  ROUND(activity_consistency, 3) AS activity_consistency,
+
+  -- Volume metrics
+  total_messages,
+  unique_messages,
+  ROUND(avg_messages_per_active_day, 2) AS avg_messages_per_active_day,
+  ROUND(content_diversity_ratio, 3) AS content_diversity_ratio,
+
+  -- Performance metrics
+  ROUND(total_earnings, 2) AS total_earnings,
+  total_sent,
+  total_viewed,
+  total_purchased,
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+  ROUND(avg_engagement_score, 4) AS avg_engagement_score,
+
+  -- Calculated performance
+  ROUND(earnings_per_message, 4) AS earnings_per_message,
+  ROUND(earnings_per_fan, 4) AS earnings_per_fan,
+  ROUND(overall_conversion_rate, 4) AS overall_conversion_rate,
+  ROUND(view_rate, 4) AS view_rate,
+
+  -- Baseline comparisons
+  ROUND(conversion_vs_baseline, 3) AS conversion_vs_baseline,
+  ROUND(rpm_vs_baseline, 3) AS rpm_vs_baseline,
+
+  -- Performance distribution
+  high_performance_messages,
+  poor_performance_messages,
+  ROUND(high_performance_rate, 3) AS high_performance_rate,
+  ROUND(poor_performance_rate, 3) AS poor_performance_rate,
+
+  -- Content characteristics
+  content_types_used,
+  ROUND(avg_message_length, 1) AS avg_message_length,
+  ROUND(avg_emoji_usage, 1) AS avg_emoji_usage,
+  ROUND(avg_novelty, 3) AS avg_novelty,
+  content_strategy,
+
+  -- Timing patterns
+  hour_diversity,
+  day_diversity,
+  preferred_send_hour,
+  preferred_day_category,
+
+  -- Quality and optimization
+  ROUND(avg_quality_score, 3) AS avg_quality_score,
+  optimization_status,
+
+  -- Trend analysis
+  performance_trend,
+  ROUND(conversion_trend_correlation, 3) AS conversion_trend_correlation,
+  ROUND(rpm_trend_correlation, 3) AS rpm_trend_correlation,
+  ROUND(conversion_trend_ratio, 3) AS conversion_trend_ratio,
+  ROUND(rpm_trend_ratio, 3) AS rpm_trend_ratio,
+
+  -- Recent performance
+  ROUND(recent_earnings_30d, 2) AS recent_earnings_30d,
+  ROUND(recent_conversion_rate, 4) AS recent_conversion_rate,
+  ROUND(recent_rpm, 4) AS recent_rpm,
+
+  -- Fan intelligence
+  estimated_fan_count,
+
+  -- Tier context
+  tier_min_rpm,
+  tier_min_conversion_rate,
+  tier_max_sends_per_day,
+  tier_priority_score,
+  eligible_for_premium_pricing,
+  ml_recommendation_weight,
+
+  -- Strategic insights
+  risk_category,
+  primary_recommendation,
+  opportunity_areas,
+  success_factors,
+
+  -- Metadata
+  CURRENT_TIMESTAMP() AS profile_analyzed_at
+
+FROM strategic_insights
+ORDER BY total_earnings DESC, avg_rpm DESC
+
+-- =====================================================================
+-- CREATOR PERFORMANCE DASHBOARD VIEW
+-- =====================================================================
+
+
+SELECT
+  creator_username,
+  creator_tier,
+  calculated_performance_tier,
+
+  -- Key performance indicators
+  ROUND(total_earnings, 0) AS total_earnings,
+  ROUND(avg_rpm, 2) AS avg_rpm,
+  ROUND(avg_conversion_rate * 100, 1) AS conversion_rate_pct,
+  total_messages,
+
+  -- Performance vs tier benchmarks
+  CASE
+    WHEN avg_rpm >= tier_min_rpm * 1.5 THEN 'EXCEEDING'
+    WHEN avg_rpm >= tier_min_rpm THEN 'MEETING'
+    ELSE 'BELOW'
+  END AS rpm_vs_tier_benchmark,
+
+  CASE
+    WHEN avg_conversion_rate >= tier_min_conversion_rate * 1.5 THEN 'EXCEEDING'
+    WHEN avg_conversion_rate >= tier_min_conversion_rate THEN 'MEETING'
+    ELSE 'BELOW'
+  END AS conversion_vs_tier_benchmark,
+
+  -- Activity status
+  activity_level,
+  days_since_last_activity,
+  ROUND(activity_consistency * 100, 1) AS activity_consistency_pct,
+
+  -- Performance trend indicators
+  performance_trend,
+  CASE
+    WHEN performance_trend IN ('STRONG_UPWARD', 'MODERATE_UPWARD') THEN '↗️'
+    WHEN performance_trend = 'STABLE' THEN '→'
+    ELSE '↘️'
+  END AS trend_indicator,
+
+  -- Quality indicators
+  optimization_status,
+  ROUND(high_performance_rate * 100, 1) AS high_performance_rate_pct,
+  content_strategy,
+
+  -- Risk and opportunities
+  risk_category,
+  primary_recommendation,
+  ARRAY_LENGTH(opportunity_areas) AS opportunity_count,
+  ARRAY_LENGTH(success_factors) AS success_factor_count,
+
+  -- Recent performance
+  recent_earnings_30d,
+  ROUND((recent_earnings_30d / NULLIF(total_earnings, 0)) * 100, 1) AS recent_earnings_contribution_pct,
+
+  profile_analyzed_at
+
+FROM `layer_01_semantic.v_page_dim`
+WHERE total_messages >= 5  -- Only include creators with meaningful activity
+ORDER BY total_earnings DESC
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'page_dim',
+  'SUCCESS',
+  'Created comprehensive creator profile intelligence with performance analysis and strategic insights',
+  CURRENT_TIMESTAMP()
+)
+
+-- Success message
+SELECT
+  'L1.06 COMPLETE' as status,
+  'Creator page dimension views created with intelligent profile analysis and strategic recommendations' as message,
+  CURRENT_TIMESTAMP() as completed_at

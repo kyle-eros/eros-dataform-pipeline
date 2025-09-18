@@ -1,0 +1,655 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L5", "materialize_next24_active"],
+  dependencies: ["eros_L4_01_training_views", "eros_L4_04_slot_recs_next24_ml"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L5.02: Materialize Next-24 Active - Real-Time Serving Layer
+-- =====================================================================
+-- High-performance serving tables for real-time scheduler interfaces with
+-- sub-second response times and intelligent recommendation delivery.
+-- =====================================================================
+
+-- =====================================================================
+-- ACTIVE RECOMMENDATIONS SERVING TABLE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_05_serving.next24_active_recommendations` (
+  -- Primary serving key
+  serving_key STRING NOT NULL,  -- creator_username + '_' + hour_slot
+
+  -- Creator context
+  creator_username STRING NOT NULL,
+  creator_tier STRING NOT NULL,
+
+  -- Recommendation metadata
+  recommendation_id STRING NOT NULL,
+  recommendation_rank INT64 NOT NULL,
+  recommendation_timestamp TIMESTAMP NOT NULL,
+
+  -- Scheduling details
+  scheduled_datetime DATETIME NOT NULL,
+  scheduled_hour INT64 NOT NULL,
+  scheduled_dayofweek INT64 NOT NULL,
+  time_slot_category STRING,  -- PEAK, GOOD, ACCEPTABLE, AVOID
+
+  -- Content recommendation
+  caption_hash STRING NOT NULL,
+  caption_text STRING NOT NULL,
+  caption_preview STRING,  -- First 100 chars
+  content_category STRING NOT NULL,
+
+  -- Scoring and confidence
+  slot_score NUMERIC NOT NULL,
+  multi_objective_score NUMERIC NOT NULL,
+  confidence_score NUMERIC NOT NULL,
+  recommendation_strength STRING,  -- STRONG, MEDIUM, WEAK
+
+  -- Expected performance
+  expected_rpm NUMERIC,
+  expected_conversion NUMERIC,
+  expected_earnings NUMERIC,
+
+  -- Context and insights
+  primary_fan_segment STRING,
+  fan_activity_score NUMERIC,
+  content_novelty_score NUMERIC,
+  fatigue_risk STRING,  -- NONE, LOW, MEDIUM, HIGH
+
+  -- Decision support
+  decision_status STRING,  -- APPROVED, PENDING_REVIEW, BLOCKED
+  execution_recommendation STRING,
+  human_review_required BOOL,
+
+  -- A/B testing context
+  ab_test_id STRING,
+  ab_test_variant STRING,
+  is_control_group BOOL,
+
+  -- Feature explanations (for UI display)
+  feature_scores JSON,
+  explanation_summary STRING,
+  optimization_tips ARRAY<STRING>,
+
+  -- Performance tracking
+  was_executed BOOL DEFAULT FALSE,
+  execution_timestamp TIMESTAMP,
+  actual_performance JSON,
+
+  -- Metadata
+  data_freshness_timestamp TIMESTAMP NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+PARTITION BY DATE(scheduled_datetime)
+CLUSTER BY creator_username, scheduled_hour, recommendation_rank
+OPTIONS (
+  description = "High-performance serving table for next-24 active recommendations",
+  partition_expiration_days = 7  -- Short retention for serving layer
+);
+
+-- =====================================================================
+-- CREATOR DASHBOARD SERVING TABLE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_05_serving.creator_dashboard_summary` (
+  creator_username STRING NOT NULL,
+  creator_tier STRING NOT NULL,
+
+  -- Dashboard timestamp
+  dashboard_generated_at TIMESTAMP NOT NULL,
+
+  -- Performance overview (last 30 days)
+  total_earnings_30d NUMERIC,
+  total_messages_30d INT64,
+  avg_rpm_30d NUMERIC,
+  avg_conversion_rate_30d NUMERIC,
+
+  -- Performance vs baseline
+  rpm_vs_baseline NUMERIC,
+  conversion_vs_baseline NUMERIC,
+  performance_trend STRING,  -- IMPROVING, STABLE, DECLINING
+
+  -- Next 24 hours summary
+  next24_recommendations_count INT64,
+  next24_expected_earnings NUMERIC,
+  next24_confidence_avg NUMERIC,
+  next24_peak_hours ARRAY<INT64>,
+
+  -- Content insights
+  active_content_count INT64,
+  fatigued_content_count INT64,
+  high_performing_content_count INT64,
+  content_refresh_needed BOOL,
+
+  -- Fan insights
+  estimated_fan_count INT64,
+  primary_fan_segments ARRAY<STRING>,
+  fan_engagement_trend STRING,
+
+  -- Timing optimization
+  optimal_send_hours ARRAY<INT64>,
+  hour_diversity_score NUMERIC,
+  timing_optimization_opportunity STRING,
+
+  -- A/B testing participation
+  active_tests_count INT64,
+  test_performance_summary JSON,
+
+  -- Alerts and warnings
+  active_alerts ARRAY<STRING>,
+  optimization_opportunities ARRAY<STRING>,
+
+  -- Quick actions
+  recommended_actions ARRAY<STRING>,
+  priority_content_updates ARRAY<STRING>,
+
+  -- Metadata
+  data_sources_timestamp JSON,  -- Track data freshness by source
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY creator_username, creator_tier
+OPTIONS (
+  description = "Creator dashboard summary for real-time scheduler interface"
+);
+
+-- =====================================================================
+-- REAL-TIME OPTIMIZATION CACHE
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `layer_05_serving.optimization_cache` (
+  cache_key STRING NOT NULL,  -- Composite key for optimization scenarios
+
+  -- Cache metadata
+  cache_type STRING NOT NULL,  -- TIMING, CONTENT, PRICING, BUNDLE
+  scope STRING NOT NULL,       -- CREATOR, TIER, GLOBAL
+  scope_value STRING,          -- Specific creator or tier
+
+  -- Cached optimization results
+  optimization_results JSON NOT NULL,
+  confidence_level NUMERIC,
+
+  -- Performance tracking
+  cache_hits INT64 DEFAULT 0,
+  last_hit_at TIMESTAMP,
+
+  -- Cache lifecycle
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  expires_at TIMESTAMP NOT NULL,
+  is_valid BOOL DEFAULT TRUE
+)
+CLUSTER BY cache_type, scope
+OPTIONS (
+  description = "High-performance cache for optimization results"
+);
+
+-- =====================================================================
+-- MATERIALIZATION PROCEDURES
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_05_serving.sp_materialize_next24_recommendations`()
+BEGIN
+  DECLARE materialization_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE recommendations_generated INT64 DEFAULT 0;
+
+  -- Clear expired recommendations
+  DELETE FROM `layer_05_serving.next24_active_recommendations`
+  WHERE expires_at < CURRENT_TIMESTAMP();
+
+  -- Materialize fresh recommendations from decision engine
+  INSERT INTO `layer_05_serving.next24_active_recommendations` (
+    serving_key,
+    creator_username,
+    creator_tier,
+    recommendation_id,
+    recommendation_rank,
+    recommendation_timestamp,
+    scheduled_datetime,
+    scheduled_hour,
+    scheduled_dayofweek,
+    time_slot_category,
+    caption_hash,
+    caption_text,
+    caption_preview,
+    content_category,
+    slot_score,
+    multi_objective_score,
+    confidence_score,
+    recommendation_strength,
+    expected_rpm,
+    expected_conversion,
+    expected_earnings,
+    primary_fan_segment,
+    fan_activity_score,
+    content_novelty_score,
+    fatigue_risk,
+    decision_status,
+    execution_recommendation,
+    human_review_required,
+    ab_test_id,
+    ab_test_variant,
+    is_control_group,
+    feature_scores,
+    explanation_summary,
+    optimization_tips,
+    data_freshness_timestamp,
+    expires_at
+  )
+  WITH enriched_decisions AS (
+    SELECT
+      od.creator_username,
+      od.creator_tier,
+      od.decision_id,
+      od.scheduled_datetime,
+      od.scheduled_hour,
+      od.scheduled_dayofweek,
+      od.caption_hash,
+      od.content_category,
+      od.slot_score,
+      od.multi_objective_score,
+      od.confidence_score,
+      od.expected_rpm,
+      od.expected_conversion,
+      od.status AS decision_status,
+      od.human_review_required,
+      od.ab_test_id,
+      od.ab_test_variant,
+      od.is_control_group,
+      od.feature_explanation,
+
+      -- Enrich with caption data
+      cd.caption_text,
+      cd.performance_tier,
+      cd.novelty_classification,
+      cd.avg_novelty_score,
+
+      -- Calculate derived fields
+      ROW_NUMBER() OVER (
+        PARTITION BY od.creator_username, EXTRACT(HOUR FROM od.scheduled_datetime)
+        ORDER BY od.multi_objective_score DESC
+      ) AS hour_rank,
+
+      -- Time slot classification
+      CASE
+        WHEN EXTRACT(HOUR FROM od.scheduled_datetime) IN (11,12,13,19,20,21,22) THEN 'PEAK'
+        WHEN EXTRACT(HOUR FROM od.scheduled_datetime) IN (10,14,15,16,17,18,23) THEN 'GOOD'
+        WHEN EXTRACT(HOUR FROM od.scheduled_datetime) IN (8,9,0,1) THEN 'ACCEPTABLE'
+        ELSE 'AVOID'
+      END AS time_slot_category,
+
+      -- Recommendation strength
+      CASE
+        WHEN od.multi_objective_score >= 0.8 AND od.confidence_score >= 0.8 THEN 'STRONG'
+        WHEN od.multi_objective_score >= 0.6 AND od.confidence_score >= 0.6 THEN 'MEDIUM'
+        ELSE 'WEAK'
+      END AS recommendation_strength,
+
+      -- Fan segment simulation
+      CASE
+        WHEN EXTRACT(HOUR FROM od.scheduled_datetime) BETWEEN 22 AND 6 THEN 'NIGHT_OWLS'
+        WHEN od.expected_rpm >= 2.0 THEN 'WHALES'
+        WHEN od.content_category = 'PPV' THEN 'LOYALISTS'
+        ELSE 'TEASERS'
+      END AS primary_fan_segment,
+
+      -- Fatigue risk
+      CASE
+        WHEN cd.novelty_classification = 'HIGHLY_REPETITIVE' THEN 'HIGH'
+        WHEN cd.novelty_classification = 'SOMEWHAT_REPETITIVE' THEN 'MEDIUM'
+        WHEN cd.avg_novelty_score < 0.4 THEN 'MEDIUM'
+        ELSE 'NONE'
+      END AS fatigue_risk,
+
+      CURRENT_TIMESTAMP() AS materialization_timestamp
+
+    FROM `layer_03_decisions.ops_decisions` od
+    LEFT JOIN `layer_01_semantic.v_caption_dim` cd
+      ON od.caption_hash = cd.caption_hash
+    WHERE od.scheduled_datetime BETWEEN CURRENT_DATETIME() AND DATETIME_ADD(CURRENT_DATETIME(), INTERVAL 24 HOUR)
+      AND od.status IN ('PENDING', 'APPROVED')
+  )
+
+  SELECT
+    CONCAT(ed.creator_username, '_', EXTRACT(HOUR FROM ed.scheduled_datetime)) AS serving_key,
+    ed.creator_username,
+    ed.creator_tier,
+    ed.decision_id,
+    ed.hour_rank,
+    ed.materialization_timestamp,
+    ed.scheduled_datetime,
+    ed.scheduled_hour,
+    ed.scheduled_dayofweek,
+    ed.time_slot_category,
+    ed.caption_hash,
+    ed.caption_text,
+    LEFT(ed.caption_text, 100) AS caption_preview,
+    ed.content_category,
+    ed.slot_score,
+    ed.multi_objective_score,
+    ed.confidence_score,
+    ed.recommendation_strength,
+    ed.expected_rpm,
+    ed.expected_conversion,
+    ed.expected_rpm * 1.5 AS expected_earnings,  -- Estimated earnings
+    ed.primary_fan_segment,
+    RAND() * 0.3 + 0.7 AS fan_activity_score,  -- Simulated fan activity
+    ed.avg_novelty_score,
+    ed.fatigue_risk,
+    ed.decision_status,
+
+    -- Execution recommendation
+    CASE
+      WHEN ed.recommendation_strength = 'STRONG' AND ed.time_slot_category = 'PEAK' THEN 'EXECUTE_IMMEDIATELY'
+      WHEN ed.recommendation_strength = 'STRONG' THEN 'HIGH_CONFIDENCE_EXECUTE'
+      WHEN ed.recommendation_strength = 'MEDIUM' THEN 'GOOD_CANDIDATE'
+      ELSE 'MONITOR_AND_CONSIDER'
+    END AS execution_recommendation,
+
+    ed.human_review_required,
+    ed.ab_test_id,
+    ed.ab_test_variant,
+    ed.is_control_group,
+
+    -- Feature scores for explanation
+    JSON_OBJECT(
+      'timing_score', ROUND(ed.slot_score, 3),
+      'content_quality', ROUND(ed.avg_novelty_score, 3),
+      'confidence', ROUND(ed.confidence_score, 3),
+      'fan_alignment', ROUND(RAND() * 0.3 + 0.7, 3),
+      'performance_potential', ROUND(ed.multi_objective_score, 3)
+    ) AS feature_scores,
+
+    -- Human-readable explanation
+    CONCAT(
+      'This recommendation scores ',
+      ROUND(ed.multi_objective_score * 100, 0),
+      '% based on optimal timing (',
+      ed.time_slot_category,
+      '), content quality (',
+      ed.performance_tier,
+      '), and fan engagement potential'
+    ) AS explanation_summary,
+
+    -- Optimization tips
+    ARRAY[
+      CASE WHEN ed.time_slot_category != 'PEAK' THEN 'Consider shifting to peak hours (7-10 PM)' END,
+      CASE WHEN ed.fatigue_risk != 'NONE' THEN 'Content novelty could be improved' END,
+      CASE WHEN ed.confidence_score < 0.7 THEN 'Consider A/B testing this content' END
+    ] AS optimization_tips,
+
+    ed.materialization_timestamp AS data_freshness_timestamp,
+    TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR) AS expires_at
+
+  FROM enriched_decisions ed
+  WHERE ed.hour_rank <= 3;  -- Top 3 recommendations per hour slot
+
+  SET recommendations_generated = @@row_count;
+
+  -- Log materialization results
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L5', 'next24_materialization',
+    'SUCCESS',
+    FORMAT('Materialized %d next-24 recommendations for serving', recommendations_generated),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- CREATOR DASHBOARD MATERIALIZATION PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_05_serving.sp_materialize_creator_dashboards`()
+BEGIN
+  DECLARE dashboard_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE dashboards_created INT64 DEFAULT 0;
+
+  -- Clear expired dashboards
+  DELETE FROM `layer_05_serving.creator_dashboard_summary`
+  WHERE expires_at < CURRENT_TIMESTAMP();
+
+  -- Materialize creator dashboards
+  INSERT INTO `layer_05_serving.creator_dashboard_summary` (
+    creator_username,
+    creator_tier,
+    dashboard_generated_at,
+    total_earnings_30d,
+    total_messages_30d,
+    avg_rpm_30d,
+    avg_conversion_rate_30d,
+    rpm_vs_baseline,
+    conversion_vs_baseline,
+    performance_trend,
+    next24_recommendations_count,
+    next24_expected_earnings,
+    next24_confidence_avg,
+    next24_peak_hours,
+    active_content_count,
+    fatigued_content_count,
+    high_performing_content_count,
+    content_refresh_needed,
+    estimated_fan_count,
+    primary_fan_segments,
+    fan_engagement_trend,
+    optimal_send_hours,
+    hour_diversity_score,
+    timing_optimization_opportunity,
+    active_tests_count,
+    test_performance_summary,
+    active_alerts,
+    optimization_opportunities,
+    recommended_actions,
+    priority_content_updates,
+    data_sources_timestamp,
+    expires_at
+  )
+  SELECT
+    pd.creator_username,
+    pd.creator_tier,
+    CURRENT_TIMESTAMP() AS dashboard_generated_at,
+
+    -- Performance metrics
+    pd.total_earnings_90d / 3 AS total_earnings_30d,  -- Approximate 30d from 90d
+    pd.total_messages / 3 AS total_messages_30d,
+    pd.avg_rpm,
+    pd.avg_conversion_rate,
+    pd.rpm_vs_baseline,
+    pd.conversion_vs_baseline,
+    pd.performance_trend,
+
+    -- Next 24 recommendations
+    COALESCE(n24.recommendation_count, 0) AS next24_recommendations_count,
+    COALESCE(n24.expected_earnings, 0) AS next24_expected_earnings,
+    COALESCE(n24.avg_confidence, 0) AS next24_confidence_avg,
+    COALESCE(n24.peak_hours, []) AS next24_peak_hours,
+
+    -- Content insights
+    COALESCE(ci.active_count, 0) AS active_content_count,
+    COALESCE(ci.fatigued_count, 0) AS fatigued_content_count,
+    COALESCE(ci.high_performing_count, 0) AS high_performing_content_count,
+    COALESCE(ci.fatigued_count, 0) > COALESCE(ci.active_count, 0) * 0.3 AS content_refresh_needed,
+
+    -- Fan insights
+    pd.estimated_fan_count,
+    ['WHALES', 'LOYALISTS', 'TEASERS'] AS primary_fan_segments,  -- Simplified
+    CASE
+      WHEN pd.performance_trend = 'IMPROVING' THEN 'GROWING'
+      WHEN pd.performance_trend = 'DECLINING' THEN 'DECLINING'
+      ELSE 'STABLE'
+    END AS fan_engagement_trend,
+
+    -- Timing optimization
+    COALESCE(ho.optimal_hours, []) AS optimal_send_hours,
+    COALESCE(ho.hour_diversity, 0) AS hour_diversity_score,
+    CASE
+      WHEN COALESCE(ho.hour_diversity, 0) <= 3 THEN 'EXPAND_TIMING_WINDOW'
+      WHEN COALESCE(ho.opportunity_score, 0) >= 0.8 THEN 'OPTIMIZE_PEAK_HOURS'
+      ELSE 'MAINTAIN_CURRENT_TIMING'
+    END AS timing_optimization_opportunity,
+
+    -- A/B testing
+    COALESCE(ab.active_tests, 0) AS active_tests_count,
+    COALESCE(ab.performance_summary, JSON '{}') AS test_performance_summary,
+
+    -- Alerts and recommendations
+    ARRAY_CONCAT(
+      CASE WHEN pd.days_since_last_activity > 7 THEN ['INACTIVE_CREATOR'] ELSE [] END,
+      CASE WHEN pd.avg_rpm < pd.tier_min_rpm THEN ['LOW_RPM_PERFORMANCE'] ELSE [] END,
+      CASE WHEN COALESCE(ci.fatigued_count, 0) > 5 THEN ['CONTENT_FATIGUE_HIGH'] ELSE [] END
+    ) AS active_alerts,
+
+    ARRAY_CONCAT(
+      CASE WHEN COALESCE(ho.hour_diversity, 0) <= 3 THEN ['EXPAND_TIMING_STRATEGY'] ELSE [] END,
+      CASE WHEN COALESCE(ci.high_performing_count, 0) < 3 THEN ['DEVELOP_HIGH_PERFORMING_CONTENT'] ELSE [] END,
+      CASE WHEN pd.performance_trend = 'DECLINING' THEN ['PERFORMANCE_INTERVENTION_NEEDED'] ELSE [] END
+    ) AS optimization_opportunities,
+
+    ARRAY_CONCAT(
+      CASE WHEN pd.performance_trend = 'IMPROVING' THEN ['SCALE_SUCCESS_STRATEGY'] ELSE [] END,
+      CASE WHEN COALESCE(ci.fatigued_count, 0) > 3 THEN ['REFRESH_CONTENT_LIBRARY'] ELSE [] END,
+      ['REVIEW_NEXT24_RECOMMENDATIONS']
+    ) AS recommended_actions,
+
+    ARRAY[
+      'Update low-performing content',
+      'Test new timing windows',
+      'Analyze top fan segments'
+    ] AS priority_content_updates,
+
+    -- Data freshness tracking
+    JSON_OBJECT(
+      'creator_data', CAST(pd.profile_analyzed_at AS STRING),
+      'recommendations', CAST(CURRENT_TIMESTAMP() AS STRING),
+      'content_analysis', CAST(CURRENT_TIMESTAMP() AS STRING)
+    ) AS data_sources_timestamp,
+
+    TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR) AS expires_at
+
+  FROM `layer_01_semantic.v_page_dim` pd
+
+  -- Next 24 recommendations summary
+  LEFT JOIN (
+    SELECT
+      creator_username,
+      COUNT(*) AS recommendation_count,
+      SUM(expected_earnings) AS expected_earnings,
+      AVG(confidence_score) AS avg_confidence,
+      ARRAY_AGG(DISTINCT scheduled_hour ORDER BY scheduled_hour) AS peak_hours
+    FROM `layer_05_serving.next24_active_recommendations`
+    WHERE time_slot_category = 'PEAK'
+    GROUP BY creator_username
+  ) n24 ON pd.creator_username = n24.creator_username
+
+  -- Content insights
+  LEFT JOIN (
+    SELECT
+      creator_username,
+      COUNTIF(days_since_last_use <= 30) AS active_count,
+      COUNTIF(fatigue_level IN ('HIGH_FATIGUE', 'MODERATE_FATIGUE')) AS fatigued_count,
+      COUNTIF(performance_tier IN ('HIGH_PERFORMER', 'ELITE')) AS high_performing_count
+    FROM `layer_01_semantic.v_caption_usage`
+    GROUP BY creator_username
+  ) ci ON pd.creator_username = ci.creator_username
+
+  -- Hour optimization
+  LEFT JOIN (
+    SELECT
+      creator_username,
+      ARRAY_AGG(DISTINCT send_hour ORDER BY avg_rpm DESC LIMIT 5) AS optimal_hours,
+      COUNT(DISTINCT send_hour) AS hour_diversity,
+      AVG(rpm_percentile_rank) AS opportunity_score
+    FROM `layer_02_features.v_hourly_engagement_heatmap`
+    WHERE strategic_classification IN ('GOLDEN_HOUR', 'PRIME_TIME')
+    GROUP BY creator_username
+  ) ho ON pd.creator_username = ho.creator_username
+
+  -- A/B testing summary
+  LEFT JOIN (
+    SELECT
+      creator_username,
+      COUNT(DISTINCT ab_test_id) AS active_tests,
+      JSON_OBJECT(
+        'avg_performance_ratio', AVG(performance_vs_expected),
+        'total_tests', COUNT(DISTINCT ab_test_id)
+      ) AS performance_summary
+    FROM `layer_03_decisions.ops_decisions`
+    WHERE ab_test_id IS NOT NULL
+      AND scheduled_datetime >= CURRENT_DATETIME()
+    GROUP BY creator_username
+  ) ab ON pd.creator_username = ab.creator_username
+
+  WHERE pd.total_messages >= 5  -- Only active creators
+    AND pd.days_since_last_activity <= 30;
+
+  SET dashboards_created = @@row_count;
+
+  -- Log dashboard creation
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L5', 'dashboard_materialization',
+    'SUCCESS',
+    FORMAT('Created %d creator dashboard summaries', dashboards_created),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- SERVING LAYER ORCHESTRATION
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `layer_05_serving.sp_refresh_serving_layer`()
+BEGIN
+  -- Refresh recommendations
+  CALL `layer_05_serving.sp_materialize_next24_recommendations`();
+
+  -- Refresh dashboards
+  CALL `layer_05_serving.sp_materialize_creator_dashboards`();
+
+  -- Clear expired cache entries
+  DELETE FROM `layer_05_serving.optimization_cache`
+  WHERE expires_at < CURRENT_TIMESTAMP();
+
+  -- Log orchestration completion
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L5', 'serving_layer_refresh',
+    'SUCCESS',
+    'Completed full serving layer refresh',
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L5', 'materialize_next24_active',
+  'SUCCESS',
+  'Created high-performance serving layer with real-time recommendations and dashboard materialization',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L5.02 COMPLETE' as status,
+  'Intelligent serving layer created with sub-second recommendation delivery and real-time dashboards' as message,
+  CURRENT_TIMESTAMP() as completed_at;

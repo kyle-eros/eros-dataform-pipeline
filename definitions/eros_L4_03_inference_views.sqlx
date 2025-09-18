@@ -1,0 +1,498 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L4", "inference_views"],
+  dependencies: ["eros_L3_01_ops_config", "eros_L3_02_next24"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L4.03: ML Inference Views for Real-time Predictions
+-- ================================================================
+-- Real-time inference views for production ML model serving
+-- Integrates with scheduler interfaces for live recommendations
+-- ================================================================
+
+-- Real-time message performance scoring
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_live_message_scoring` AS
+WITH live_features AS (
+  SELECT
+    creator_name,
+    CURRENT_TIMESTAMP() AS scoring_time,
+
+    -- Current time features
+    EXTRACT(HOUR FROM CURRENT_TIMESTAMP()) AS current_hour,
+    EXTRACT(DAYOFWEEK FROM CURRENT_TIMESTAMP()) AS current_dow,
+    EXTRACT(DAY FROM CURRENT_TIMESTAMP()) AS current_day,
+
+    -- Creator's recent performance (last 30 days)
+    AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) AS creator_recent_view_rate,
+    AVG(CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END) AS creator_recent_conversion_rate,
+
+    -- Creator's typical timing
+    AVG(EXTRACT(HOUR FROM sending_time)) AS creator_avg_hour,
+
+    -- Last message timing
+    MAX(sending_time) AS last_message_time,
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(sending_time), HOUR) AS hours_since_last_message
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master` m
+  JOIN `of-scheduler-proj.layer_01_semantic.v_message_facts_by_page` f
+    ON m.sender = f.creator_name
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND sent > 0
+  GROUP BY creator_name
+),
+
+content_templates AS (
+  SELECT
+    'STANDARD_PPV' AS template_type,
+    120 AS avg_length,
+    15 AS avg_words,
+    1 AS has_price_mention,
+    1 AS has_urgency,
+    0 AS has_emoji
+  UNION ALL
+  SELECT
+    'CASUAL_ENGAGEMENT',
+    85,
+    12,
+    0,
+    0,
+    1
+  UNION ALL
+  SELECT
+    'PREMIUM_EXCLUSIVE',
+    150,
+    20,
+    1,
+    1,
+    1
+),
+
+scoring_matrix AS (
+  SELECT
+    l.*,
+    t.template_type,
+    t.avg_length AS message_length,
+    t.avg_words AS word_count,
+    t.has_price_mention,
+    t.has_urgency,
+    t.has_emoji,
+
+    -- Timing deviation
+    ABS(l.current_hour - l.creator_avg_hour) AS hour_deviation_from_avg,
+
+    -- Default price for prediction
+    25.0 AS price_numeric
+
+  FROM live_features l
+  CROSS JOIN content_templates t
+),
+
+ml_scores AS (
+  SELECT
+    s.*,
+
+    -- Live ML predictions (using the trained models)
+    p1.predicted_view_rate,
+    p2.predicted_conversion_rate,
+
+    -- Calculate expected revenue
+    s.creator_recent_view_rate * p2.predicted_conversion_rate * s.price_numeric AS predicted_revenue,
+
+    -- Recency bonus (encourages spacing messages appropriately)
+    CASE
+      WHEN s.hours_since_last_message >= 12 THEN 1.0
+      WHEN s.hours_since_last_message >= 8 THEN 0.8
+      WHEN s.hours_since_last_message >= 4 THEN 0.6
+      WHEN s.hours_since_last_message >= 2 THEN 0.4
+      ELSE 0.2
+    END AS recency_multiplier
+
+  FROM scoring_matrix s
+
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_message_performance`,
+    (
+      SELECT
+        current_hour AS send_hour,
+        current_dow AS send_dow,
+        current_day AS send_day,
+        message_length,
+        word_count,
+        has_price_mention,
+        has_urgency,
+        has_emoji,
+        creator_recent_view_rate AS creator_avg_view_rate_30d,
+        creator_recent_conversion_rate AS creator_avg_conversion_rate_30d,
+        hour_deviation_from_avg,
+        price_numeric
+      FROM scoring_matrix
+    )
+  ) p1 ON TRUE
+
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_conversion_rate`,
+    (
+      SELECT
+        current_hour AS send_hour,
+        current_dow AS send_dow,
+        message_length,
+        word_count,
+        has_price_mention,
+        has_urgency,
+        has_emoji,
+        creator_recent_view_rate AS creator_avg_view_rate_30d,
+        creator_recent_conversion_rate AS creator_avg_conversion_rate_30d,
+        price_numeric
+      FROM scoring_matrix
+    )
+  ) p2 ON TRUE
+)
+
+SELECT
+  creator_name,
+  template_type,
+  scoring_time,
+
+  -- ML predictions
+  ROUND(predicted_view_rate, 4) AS predicted_view_rate,
+  ROUND(predicted_conversion_rate, 4) AS predicted_conversion_rate,
+  ROUND(predicted_revenue, 2) AS predicted_revenue,
+
+  -- Composite score with recency
+  ROUND(predicted_revenue * recency_multiplier, 2) AS adjusted_score,
+
+  -- Timing recommendations
+  current_hour,
+  CASE
+    WHEN current_hour BETWEEN 19 AND 23 THEN 'PRIME_TIME'
+    WHEN current_hour BETWEEN 12 AND 18 THEN 'AFTERNOON'
+    WHEN current_hour BETWEEN 6 AND 11 THEN 'MORNING'
+    ELSE 'LATE_NIGHT'
+  END AS time_period,
+
+  -- Message timing quality
+  CASE
+    WHEN hours_since_last_message >= 8 THEN 'OPTIMAL'
+    WHEN hours_since_last_message >= 4 THEN 'GOOD'
+    WHEN hours_since_last_message >= 2 THEN 'ACCEPTABLE'
+    ELSE 'TOO_SOON'
+  END AS timing_quality,
+
+  -- Content recommendation
+  CASE template_type
+    WHEN 'STANDARD_PPV' THEN 'Use proven PPV format with price and urgency'
+    WHEN 'CASUAL_ENGAGEMENT' THEN 'Light engagement with emoji, build connection'
+    WHEN 'PREMIUM_EXCLUSIVE' THEN 'High-value exclusive content positioning'
+  END AS content_strategy,
+
+  -- Meta information
+  hours_since_last_message,
+  recency_multiplier,
+  creator_recent_view_rate,
+  creator_recent_conversion_rate
+
+FROM ml_scores
+
+
+-- Live optimal timing recommendations
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_live_timing_recommendations` AS
+WITH hourly_schedule AS (
+  SELECT
+    creator_name,
+    schedule_hour,
+    schedule_dow,
+
+    -- Calculate features for each possible hour
+    COS(2 * 3.14159 * schedule_hour / 24) AS hour_cos,
+    SIN(2 * 3.14159 * schedule_hour / 24) AS hour_sin,
+
+    CASE WHEN schedule_dow = 1 THEN 1 ELSE 0 END AS is_sunday,
+    CASE WHEN schedule_dow = 7 THEN 1 ELSE 0 END AS is_saturday,
+    CASE WHEN schedule_dow IN (2,3,4,5,6) THEN 1 ELSE 0 END AS is_weekday,
+
+    -- Get creator's historical performance for this hour/day
+    COALESCE(h.avg_view_rate, 0.08) AS avg_view_rate,
+    COALESCE(h.avg_conversion_rate, 0.04) AS avg_conversion_rate,
+    COALESCE(h.revenue_ratio_vs_day_avg, 1.0) AS revenue_ratio_vs_day_avg,
+    COALESCE(h.view_rate_ratio_vs_day_avg, 1.0) AS view_rate_ratio_vs_day_avg
+
+  FROM (
+    SELECT DISTINCT creator_name FROM `of-scheduler-proj.layer_04_semantic.v_message_facts_by_page`
+  ) c
+  CROSS JOIN (
+    SELECT hour AS schedule_hour, dow AS schedule_dow
+    FROM UNNEST(GENERATE_ARRAY(6, 23)) AS hour  -- 6 AM to 11 PM
+    CROSS JOIN UNNEST([1,2,3,4,5,6,7]) AS dow   -- All days of week
+  ) times
+
+  LEFT JOIN `of-scheduler-proj.layer_02_features.v_creator_hourly_patterns` h
+    ON c.creator_name = h.creator_name
+    AND times.schedule_hour = h.hour_of_day
+    AND times.schedule_dow = h.day_of_week
+),
+
+timing_predictions AS (
+  SELECT
+    h.*,
+
+    -- ML prediction for optimal timing
+    p.predicted_is_best_revenue_hour,
+    p.predicted_is_best_revenue_hour_probs[OFFSET(0)].prob AS optimal_probability
+
+  FROM hourly_schedule h
+
+  LEFT JOIN ML.PREDICT(
+    MODEL `of-scheduler-proj.layer_04_ml.model_optimal_timing`,
+    (
+      SELECT
+        schedule_hour AS send_hour,
+        schedule_dow AS send_dow,
+        hour_cos,
+        hour_sin,
+        is_sunday,
+        is_saturday,
+        is_weekday,
+        avg_view_rate,
+        avg_conversion_rate,
+        revenue_ratio_vs_day_avg,
+        view_rate_ratio_vs_day_avg
+      FROM hourly_schedule
+    )
+  ) p ON TRUE
+),
+
+next_24_hours AS (
+  SELECT
+    t.*,
+
+    -- Create timestamp for the next occurrence of this hour/day
+    CASE
+      WHEN t.schedule_dow = EXTRACT(DAYOFWEEK FROM CURRENT_TIMESTAMP())
+        AND t.schedule_hour > EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
+      THEN
+        TIMESTAMP(
+          CONCAT(
+            CURRENT_DATE(),
+            ' ',
+            LPAD(CAST(t.schedule_hour AS STRING), 2, '0'),
+            ':00:00'
+          )
+        )
+      ELSE
+        TIMESTAMP(
+          CONCAT(
+            DATE_ADD(CURRENT_DATE(), INTERVAL t.schedule_dow - EXTRACT(DAYOFWEEK FROM CURRENT_TIMESTAMP()) DAY),
+            ' ',
+            LPAD(CAST(t.schedule_hour AS STRING), 2, '0'),
+            ':00:00'
+          )
+        )
+    END AS next_occurrence
+
+  FROM timing_predictions t
+),
+
+ranked_slots AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_name
+      ORDER BY optimal_probability DESC, next_occurrence ASC
+    ) AS timing_rank
+
+  FROM next_24_hours
+  WHERE next_occurrence BETWEEN CURRENT_TIMESTAMP()
+    AND TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+)
+
+SELECT
+  creator_name,
+  next_occurrence AS recommended_time,
+  schedule_hour AS recommended_hour,
+  schedule_dow AS day_of_week,
+  ROUND(optimal_probability, 3) AS optimization_score,
+  timing_rank,
+
+  -- Human-readable display
+  FORMAT_TIMESTAMP('%A %I:%M %p', next_occurrence) AS time_display,
+  TIMESTAMP_DIFF(next_occurrence, CURRENT_TIMESTAMP(), MINUTE) AS minutes_until,
+
+  -- Quality assessment
+  CASE
+    WHEN optimal_probability > 0.7 THEN 'EXCELLENT'
+    WHEN optimal_probability > 0.5 THEN 'GOOD'
+    WHEN optimal_probability > 0.3 THEN 'FAIR'
+    ELSE 'POOR'
+  END AS timing_quality,
+
+  -- Historical context
+  ROUND(avg_view_rate, 3) AS historical_view_rate,
+  ROUND(avg_conversion_rate, 3) AS historical_conversion_rate
+
+FROM ranked_slots
+WHERE timing_rank <= 5  -- Top 5 recommendations per creator
+ORDER BY creator_name, timing_rank
+
+
+-- Content optimization recommendations using Gemini
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_live_content_optimization` AS
+WITH content_analysis AS (
+  SELECT
+    creator_name,
+
+    -- Recent content performance
+    AVG(CASE WHEN revenue_per_message > 0 THEN revenue_per_message END) AS avg_revenue_per_message,
+
+    -- Most successful content patterns (last 30 days)
+    COUNTIF(has_price_mention = 1 AND revenue_quartile >= 3) / NULLIF(COUNTIF(has_price_mention = 1), 0) AS price_mention_success_rate,
+    COUNTIF(has_urgency = 1 AND revenue_quartile >= 3) / NULLIF(COUNTIF(has_urgency = 1), 0) AS urgency_success_rate,
+    COUNTIF(has_emoji = 1 AND revenue_quartile >= 3) / NULLIF(COUNTIF(has_emoji = 1), 0) AS emoji_success_rate,
+    COUNTIF(has_question = 1 AND revenue_quartile >= 3) / NULLIF(COUNTIF(has_question = 1), 0) AS question_success_rate,
+
+    -- Best performing content categories
+    MODE() OVER (
+      PARTITION BY creator_name
+      ORDER BY revenue_quartile DESC
+    ) AS best_content_category,
+
+    -- Optimal length analysis
+    AVG(CASE WHEN revenue_quartile >= 3 THEN char_count END) AS optimal_char_count,
+    AVG(CASE WHEN revenue_quartile >= 3 THEN word_count END) AS optimal_word_count
+
+  FROM `of-scheduler-proj.layer_04_ml.v_training_content_features`
+  WHERE DATE(event_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  GROUP BY creator_name
+),
+
+content_recommendations AS (
+  SELECT
+    creator_name,
+
+    -- Content strategy recommendations
+    CASE
+      WHEN price_mention_success_rate > 0.6 THEN 'Include specific pricing'
+      WHEN price_mention_success_rate < 0.3 THEN 'Avoid explicit pricing'
+      ELSE 'Test pricing mentions'
+    END AS pricing_strategy,
+
+    CASE
+      WHEN urgency_success_rate > 0.5 THEN 'Use urgency language'
+      WHEN urgency_success_rate < 0.3 THEN 'Focus on value over urgency'
+      ELSE 'Moderate urgency'
+    END AS urgency_strategy,
+
+    CASE
+      WHEN emoji_success_rate > 0.5 THEN 'Include relevant emojis'
+      WHEN emoji_success_rate < 0.3 THEN 'Minimize emoji use'
+      ELSE 'Selective emoji use'
+    END AS emoji_strategy,
+
+    CASE
+      WHEN question_success_rate > 0.5 THEN 'Use engaging questions'
+      ELSE 'Use direct statements'
+    END AS engagement_strategy,
+
+    -- Length recommendations
+    CASE
+      WHEN optimal_char_count > 150 THEN 'Longer detailed messages work best'
+      WHEN optimal_char_count < 80 THEN 'Short punchy messages perform better'
+      ELSE 'Medium length messages (80-150 chars)'
+    END AS length_strategy,
+
+    -- Performance metrics
+    ROUND(avg_revenue_per_message, 2) AS avg_revenue,
+    ROUND(price_mention_success_rate, 2) AS price_success_rate,
+    ROUND(urgency_success_rate, 2) AS urgency_success_rate,
+    ROUND(emoji_success_rate, 2) AS emoji_success_rate,
+    ROUND(optimal_char_count, 0) AS optimal_length
+
+  FROM content_analysis
+)
+
+SELECT
+  creator_name,
+  pricing_strategy,
+  urgency_strategy,
+  emoji_strategy,
+  engagement_strategy,
+  length_strategy,
+
+  -- Combined content recommendation
+  CONCAT(
+    pricing_strategy, '. ',
+    urgency_strategy, '. ',
+    emoji_strategy, '. ',
+    engagement_strategy, '. ',
+    length_strategy, '.'
+  ) AS content_guidance,
+
+  -- Performance context
+  avg_revenue,
+  optimal_length,
+
+  -- Success rates for transparency
+  price_success_rate,
+  urgency_success_rate,
+  emoji_success_rate
+
+FROM content_recommendations
+ORDER BY avg_revenue DESC
+
+
+-- Live scheduler interface view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_scheduler_live_recommendations` AS
+SELECT
+  s.creator_name,
+  s.template_type,
+  s.predicted_revenue,
+  s.adjusted_score,
+  s.timing_quality,
+  s.content_strategy,
+  s.hours_since_last_message,
+
+  -- Timing recommendations
+  t.recommended_time,
+  t.time_display,
+  t.minutes_until,
+  t.optimization_score AS timing_score,
+
+  -- Content optimization
+  c.content_guidance,
+  c.optimal_length,
+
+  -- Overall recommendation score
+  ROUND(
+    (s.adjusted_score * 0.4) +
+    (t.optimization_score * 300 * 0.4) +  -- Scale timing score to revenue scale
+    (CASE s.timing_quality
+      WHEN 'OPTIMAL' THEN 100
+      WHEN 'GOOD' THEN 75
+      WHEN 'ACCEPTABLE' THEN 50
+      ELSE 25
+    END * 0.2)
+  , 2) AS overall_recommendation_score,
+
+  -- Action recommendations
+  CASE
+    WHEN s.timing_quality = 'TOO_SOON' THEN 'Wait - too soon since last message'
+    WHEN t.minutes_until > 60 THEN 'Schedule for optimal time'
+    WHEN s.adjusted_score > 100 THEN 'Send now - high potential'
+    ELSE 'Consider waiting for better timing'
+  END AS action_recommendation,
+
+  CURRENT_TIMESTAMP() AS generated_at
+
+FROM `of-scheduler-proj.layer_04_ml.v_live_message_scoring` s
+
+LEFT JOIN `of-scheduler-proj.layer_04_ml.v_live_timing_recommendations` t
+  ON s.creator_name = t.creator_name
+  AND t.timing_rank = 1  -- Best timing option
+
+LEFT JOIN `of-scheduler-proj.layer_04_ml.v_live_content_optimization` c
+  ON s.creator_name = c.creator_name
+
+WHERE s.template_type = 'STANDARD_PPV'  -- Default to standard PPV recommendations
+ORDER BY overall_recommendation_score DESC

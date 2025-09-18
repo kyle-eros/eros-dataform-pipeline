@@ -1,0 +1,416 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L6", "config"],
+  dependencies: ["eros_L5_02_materialize_next24_active"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L6.01: Analytics & Monitoring Configuration
+-- ================================================================
+-- Configuration tables for monitoring, alerting, and analytics
+-- Defines thresholds, alert rules, and monitoring policies
+-- ================================================================
+
+-- Alert configuration table
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_06_monitoring.alert_configurations` (
+  alert_id STRING NOT NULL,
+  alert_name STRING NOT NULL,
+  alert_category STRING NOT NULL,  -- PERFORMANCE, QUALITY, SYSTEM, BUSINESS
+  metric_source STRING NOT NULL,   -- Table/view to monitor
+  metric_column STRING,            -- Specific column if applicable
+  threshold_type STRING NOT NULL,  -- GT, LT, EQ, BETWEEN, ANOMALY
+  threshold_value FLOAT64,
+  threshold_value_2 FLOAT64,       -- For BETWEEN conditions
+  evaluation_window_minutes INT64 DEFAULT 60,
+  alert_severity STRING DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
+  is_active BOOL DEFAULT true,
+  alert_description STRING,
+  remediation_steps STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING,
+  last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  modified_by STRING
+)
+CLUSTER BY (alert_category, alert_severity)
+;
+
+-- Initialize monitoring alerts
+INSERT INTO `of-scheduler-proj.layer_06_monitoring.alert_configurations` (
+  alert_id,
+  alert_name,
+  alert_category,
+  metric_source,
+  metric_column,
+  threshold_type,
+  threshold_value,
+  evaluation_window_minutes,
+  alert_severity,
+  alert_description,
+  remediation_steps,
+  created_by
+) VALUES
+  -- System Health Alerts
+  ('SYS_001', 'ML Recommendations Stale', 'SYSTEM',
+   'layer_04_ml.next24_ml_recommendations_latest', 'generated_at',
+   'LT', -120, 30, 'HIGH',
+   'ML recommendations have not been updated in over 2 hours',
+   '1. Check ML prediction pipeline 2. Verify model serving 3. Run sp_refresh_next24_ml_recommendations'),
+
+  ('SYS_002', 'Data Ingestion Lag', 'SYSTEM',
+   'of-scheduler-proj.layer_00_ingestion.mass_message_master', 'loaded_at',
+   'LT', -360, 60, 'MEDIUM',
+   'New message data has not been loaded in over 6 hours',
+   '1. Check Gmail ETL status 2. Verify BigQuery load jobs 3. Check staging table'),
+
+  ('SYS_003', 'High Error Rate', 'SYSTEM',
+   'layer_06_monitoring.system_events', 'event_type',
+   'GT', 10, 15, 'CRITICAL',
+   'System error rate exceeds threshold',
+   '1. Check error logs 2. Identify error patterns 3. Escalate to engineering'),
+
+  -- Performance Alerts
+  ('PERF_001', 'Low Average View Rate', 'PERFORMANCE',
+   'layer_01_semantic.v_message_facts_by_page', 'avg_view_rate_7d',
+   'LT', 0.05, 1440, 'MEDIUM',
+   'Creator average view rate has dropped below 5%',
+   '1. Review message timing 2. Check content quality 3. Analyze audience engagement'),
+
+  ('PERF_002', 'Revenue Drop', 'BUSINESS',
+   'layer_01_semantic.v_message_facts_by_page', 'total_revenue_7d',
+   'LT', 0.7, 1440, 'HIGH',
+   'Creator revenue has dropped more than 30% in 7 days',
+   '1. Investigate message performance 2. Review pricing strategy 3. Check competitor activity'),
+
+  ('PERF_003', 'Conversion Rate Decline', 'PERFORMANCE',
+   'layer_01_semantic.v_message_facts_by_page', 'avg_conversion_rate_7d',
+   'LT', 0.03, 1440, 'MEDIUM',
+   'Creator conversion rate below 3%',
+   '1. Review message content 2. Check pricing strategy 3. Analyze timing patterns'),
+
+  -- Quality Alerts
+  ('QUAL_001', 'High Duplicate Rate', 'QUALITY',
+   'of-scheduler-proj.layer_00_ingestion.v_l0_sanity_duplicates', NULL,
+   'GT', 0, 60, 'HIGH',
+   'Duplicate messages detected in ingestion',
+   '1. Check deduplication logic 2. Review message_id generation 3. Investigate data source'),
+
+  ('QUAL_002', 'ML Prediction Accuracy Drop', 'QUALITY',
+   'layer_04_ml.v_sanity_performance_validation', 'avg_view_rate_mape_percent',
+   'GT', 40, 720, 'MEDIUM',
+   'ML model prediction accuracy has degraded',
+   '1. Retrain models 2. Check feature drift 3. Validate training data'),
+
+  ('QUAL_003', 'Low Recommendation Quality', 'QUALITY',
+   'layer_04_ml.next24_ml_recommendations_latest', NULL,
+   'LT', 0.1, 60, 'MEDIUM',
+   'Less than 10% of recommendations are high quality',
+   '1. Review ML model performance 2. Check feature engineering 3. Validate scoring logic'),
+
+  -- Business Alerts
+  ('BIZ_001', 'Creator Inactivity', 'BUSINESS',
+   'layer_01_semantic.v_message_facts_by_page', 'last_message_time',
+   'LT', -172800, 1440, 'LOW',  -- 48 hours
+   'Creator has not sent messages in over 48 hours',
+   '1. Contact creator 2. Check scheduling conflicts 3. Review engagement metrics'),
+
+  ('BIZ_002', 'Message Volume Drop', 'BUSINESS',
+   'layer_01_semantic.v_message_facts_by_page', 'total_messages_7d',
+   'LT', 0.5, 1440, 'MEDIUM',
+   'Creator message volume dropped more than 50% in 7 days',
+   '1. Check creator health 2. Review scheduling optimization 3. Investigate technical issues')
+;
+
+-- Monitoring dashboard configuration
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_06_monitoring.dashboard_configurations` (
+  dashboard_id STRING NOT NULL,
+  dashboard_name STRING NOT NULL,
+  dashboard_category STRING NOT NULL,  -- OPERATIONAL, EXECUTIVE, TECHNICAL
+  refresh_interval_minutes INT64 DEFAULT 60,
+  is_active BOOL DEFAULT true,
+  access_level STRING DEFAULT 'STANDARD',  -- PUBLIC, STANDARD, RESTRICTED, ADMIN
+  dashboard_description STRING,
+  primary_metrics ARRAY<STRING>,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING
+)
+;
+
+-- Initialize dashboard configurations
+INSERT INTO `of-scheduler-proj.layer_06_monitoring.dashboard_configurations` (
+  dashboard_id,
+  dashboard_name,
+  dashboard_category,
+  refresh_interval_minutes,
+  access_level,
+  dashboard_description,
+  primary_metrics,
+  created_by
+) VALUES
+  ('DASH_001', 'System Health Overview', 'OPERATIONAL', 15, 'STANDARD',
+   'Real-time system health and operational metrics',
+   ['ml_system_status', 'data_freshness', 'prediction_accuracy', 'error_rate'],
+   'system_init'),
+
+  ('DASH_002', 'Creator Performance Analytics', 'EXECUTIVE', 60, 'STANDARD',
+   'Creator revenue, engagement, and performance metrics',
+   ['revenue_trends', 'engagement_rates', 'creator_rankings', 'growth_metrics'],
+   'system_init'),
+
+  ('DASH_003', 'ML Model Performance', 'TECHNICAL', 30, 'RESTRICTED',
+   'ML model accuracy, drift detection, and feature importance',
+   ['prediction_accuracy', 'model_drift', 'feature_importance', 'training_metrics'],
+   'system_init'),
+
+  ('DASH_004', 'Business Intelligence', 'EXECUTIVE', 240, 'RESTRICTED',
+   'High-level business metrics and strategic insights',
+   ['revenue_by_tier', 'market_trends', 'competitive_analysis', 'forecasts'],
+   'system_init')
+;
+
+-- KPI definitions and targets
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_06_monitoring.kpi_definitions` (
+  kpi_id STRING NOT NULL,
+  kpi_name STRING NOT NULL,
+  kpi_category STRING NOT NULL,
+  metric_source STRING NOT NULL,
+  calculation_method STRING NOT NULL,
+  target_value FLOAT64,
+  target_operator STRING,  -- GT, LT, EQ, BETWEEN
+  target_timeframe STRING, -- DAILY, WEEKLY, MONTHLY
+  unit_of_measure STRING,
+  kpi_description STRING,
+  is_critical BOOL DEFAULT false,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING
+)
+;
+
+-- Initialize KPI definitions
+INSERT INTO `of-scheduler-proj.layer_06_monitoring.kpi_definitions` (
+  kpi_id,
+  kpi_name,
+  kpi_category,
+  metric_source,
+  calculation_method,
+  target_value,
+  target_operator,
+  target_timeframe,
+  unit_of_measure,
+  kpi_description,
+  is_critical,
+  created_by
+) VALUES
+  ('KPI_001', 'System Uptime', 'OPERATIONAL',
+   'layer_06_monitoring.system_events',
+   'COUNT_ERRORS / TOTAL_EVENTS',
+   99.5, 'GT', 'DAILY', 'PERCENTAGE',
+   'Percentage of time system is operational without critical errors',
+   true, 'system_init'),
+
+  ('KPI_002', 'Average Creator Revenue', 'BUSINESS',
+   'layer_01_semantic.v_message_facts_by_page',
+   'AVG(total_revenue_7d)',
+   1000, 'GT', 'WEEKLY', 'USD',
+   'Average weekly revenue per active creator',
+   true, 'system_init'),
+
+  ('KPI_003', 'ML Prediction Accuracy', 'TECHNICAL',
+   'layer_04_ml.v_sanity_performance_validation',
+   '1 - AVG(view_rate_relative_error)',
+   0.8, 'GT', 'DAILY', 'PERCENTAGE',
+   'Accuracy of ML view rate predictions',
+   true, 'system_init'),
+
+  ('KPI_004', 'Message Engagement Rate', 'PERFORMANCE',
+   'layer_01_semantic.v_message_facts_by_page',
+   'AVG(avg_view_rate_7d)',
+   0.12, 'GT', 'WEEKLY', 'PERCENTAGE',
+   'Average message view rate across all creators',
+   false, 'system_init'),
+
+  ('KPI_005', 'Revenue Growth Rate', 'BUSINESS',
+   'layer_01_semantic.v_message_facts_by_page',
+   '(THIS_WEEK_REVENUE - LAST_WEEK_REVENUE) / LAST_WEEK_REVENUE',
+   0.05, 'GT', 'WEEKLY', 'PERCENTAGE',
+   'Week-over-week revenue growth rate',
+   true, 'system_init')
+;
+
+-- Monitoring schedule configuration
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_06_monitoring.monitoring_schedules` (
+  schedule_id STRING NOT NULL,
+  schedule_name STRING NOT NULL,
+  monitoring_type STRING NOT NULL,  -- ALERT, KPI, HEALTH_CHECK, REPORT
+  target_resource STRING NOT NULL,
+  execution_frequency STRING NOT NULL,  -- MINUTE, HOURLY, DAILY, WEEKLY
+  execution_interval INT64 DEFAULT 1,
+  is_active BOOL DEFAULT true,
+  next_execution TIMESTAMP,
+  last_execution TIMESTAMP,
+  execution_count INT64 DEFAULT 0,
+  failure_count INT64 DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING
+)
+;
+
+-- Initialize monitoring schedules
+INSERT INTO `of-scheduler-proj.layer_06_monitoring.monitoring_schedules` (
+  schedule_id,
+  schedule_name,
+  monitoring_type,
+  target_resource,
+  execution_frequency,
+  execution_interval,
+  next_execution,
+  created_by
+) VALUES
+  ('SCHED_001', 'Real-time Alert Monitoring', 'ALERT',
+   'layer_06_monitoring.alert_configurations',
+   'MINUTE', 5,
+   TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 5 MINUTE),
+   'system_init'),
+
+  ('SCHED_002', 'ML Health Check', 'HEALTH_CHECK',
+   'layer_04_ml.v_sanity_ml_system_health',
+   'MINUTE', 15,
+   TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 15 MINUTE),
+   'system_init'),
+
+  ('SCHED_003', 'KPI Evaluation', 'KPI',
+   'layer_06_monitoring.kpi_definitions',
+   'HOURLY', 1,
+   TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR),
+   'system_init'),
+
+  ('SCHED_004', 'Daily Performance Report', 'REPORT',
+   'layer_06_monitoring.v_daily_performance_summary',
+   'DAILY', 1,
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY), INTERVAL 1 DAY),
+   'system_init'),
+
+  ('SCHED_005', 'Weekly Business Review', 'REPORT',
+   'layer_06_monitoring.v_weekly_business_metrics',
+   'WEEKLY', 1,
+   TIMESTAMP_ADD(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), WEEK), INTERVAL 1 WEEK),
+   'system_init')
+;
+
+-- System configuration view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_06_monitoring.v_monitoring_configuration_summary` AS
+SELECT
+  'Alert Configurations' AS config_type,
+  COUNT(*) AS total_items,
+  COUNTIF(is_active) AS active_items,
+  COUNTIF(alert_severity = 'CRITICAL') AS critical_items,
+  STRING_AGG(DISTINCT alert_category ORDER BY alert_category) AS categories
+FROM `of-scheduler-proj.layer_06_monitoring.alert_configurations`
+
+UNION ALL
+
+SELECT
+  'Dashboard Configurations',
+  COUNT(*),
+  COUNTIF(is_active),
+  COUNTIF(access_level = 'RESTRICTED'),
+  STRING_AGG(DISTINCT dashboard_category ORDER BY dashboard_category)
+FROM `of-scheduler-proj.layer_06_monitoring.dashboard_configurations`
+
+UNION ALL
+
+SELECT
+  'KPI Definitions',
+  COUNT(*),
+  COUNT(*) AS active_items,  -- All KPIs are considered active
+  COUNTIF(is_critical),
+  STRING_AGG(DISTINCT kpi_category ORDER BY kpi_category)
+FROM `of-scheduler-proj.layer_06_monitoring.kpi_definitions`
+
+UNION ALL
+
+SELECT
+  'Monitoring Schedules',
+  COUNT(*),
+  COUNTIF(is_active),
+  COUNTIF(execution_frequency = 'MINUTE'),
+  STRING_AGG(DISTINCT monitoring_type ORDER BY monitoring_type)
+FROM `of-scheduler-proj.layer_06_monitoring.monitoring_schedules`
+;
+
+-- Configuration management procedures
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_06_monitoring.sp_update_alert_threshold`(
+  alert_id_param STRING,
+  new_threshold FLOAT64,
+  modified_by_user STRING
+)
+BEGIN
+  UPDATE `of-scheduler-proj.layer_06_monitoring.alert_configurations`
+  SET
+    threshold_value = new_threshold,
+    last_modified = CURRENT_TIMESTAMP(),
+    modified_by = modified_by_user
+  WHERE alert_id = alert_id_param;
+
+  -- Log the configuration change
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'CONFIG_CHANGE',
+    'layer_06_monitoring',
+    CONCAT('Alert threshold updated for ', alert_id_param),
+    TO_JSON_STRING(STRUCT(
+      alert_id_param AS alert_id,
+      new_threshold,
+      modified_by_user
+    ))
+  );
+END;
+
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_06_monitoring.sp_toggle_monitoring_schedule`(
+  schedule_id_param STRING,
+  is_active_flag BOOL,
+  modified_by_user STRING
+)
+BEGIN
+  UPDATE `of-scheduler-proj.layer_06_monitoring.monitoring_schedules`
+  SET
+    is_active = is_active_flag,
+    next_execution = CASE
+      WHEN is_active_flag THEN
+        CASE execution_frequency
+          WHEN 'MINUTE' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL execution_interval MINUTE)
+          WHEN 'HOURLY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL execution_interval HOUR)
+          WHEN 'DAILY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL execution_interval DAY)
+          WHEN 'WEEKLY' THEN TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL execution_interval * 7 DAY)
+          ELSE NULL
+        END
+      ELSE NULL
+    END
+  WHERE schedule_id = schedule_id_param;
+
+  -- Log the schedule change
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'SCHEDULE_CHANGE',
+    'layer_06_monitoring',
+    CONCAT('Monitoring schedule ', IF(is_active_flag, 'enabled', 'disabled'), ' for ', schedule_id_param),
+    TO_JSON_STRING(STRUCT(
+      schedule_id_param AS schedule_id,
+      is_active_flag,
+      modified_by_user
+    ))
+  );
+END;

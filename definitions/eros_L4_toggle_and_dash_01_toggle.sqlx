@@ -1,0 +1,372 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L4", "toggle"],
+  dependencies: ["eros_L3_01_ops_config", "eros_L3_02_next24"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L4: ML Toggle Controls and Dashboard Configuration
+-- ================================================================
+-- Controls for enabling/disabling ML features and dashboard setup
+-- Allows graceful fallback to rule-based systems when needed
+-- ================================================================
+
+-- ML Feature Toggle Configuration
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_04_ml.ml_feature_toggles` (
+  feature_name STRING NOT NULL,
+  is_enabled BOOL NOT NULL DEFAULT true,
+  enabled_by STRING,
+  enabled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  description STRING,
+  fallback_behavior STRING,
+  last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  modified_by STRING
+)
+CLUSTER BY (feature_name)
+;
+
+-- Initialize ML feature toggles
+INSERT INTO `of-scheduler-proj.layer_04_ml.ml_feature_toggles` (
+  feature_name,
+  is_enabled,
+  enabled_by,
+  description,
+  fallback_behavior
+) VALUES
+  ('ml_view_rate_prediction', true, 'system_init', 'ML-based view rate prediction model', 'Use historical averages'),
+  ('ml_conversion_prediction', true, 'system_init', 'ML-based conversion rate prediction model', 'Use historical averages'),
+  ('ml_timing_optimization', true, 'system_init', 'ML-based optimal timing prediction', 'Use heuristic timing rules'),
+  ('ml_content_optimization', true, 'system_init', 'ML-based content performance prediction', 'Use rule-based content scoring'),
+  ('ml_enhanced_slot_scoring', true, 'system_init', 'ML-enhanced slot scoring algorithm', 'Use original slot scoring UDF'),
+  ('gemini_content_generation', false, 'system_init', 'Gemini AI content generation', 'Use template-based content'),
+  ('vertex_ai_automl', true, 'system_init', 'Vertex AI AutoML integration', 'Use BigQuery ML models only'),
+  ('real_time_predictions', true, 'system_init', 'Real-time ML prediction serving', 'Use pre-computed batch predictions'),
+  ('ml_performance_monitoring', true, 'system_init', 'ML model performance monitoring', 'Basic system monitoring only'),
+  ('adaptive_learning', false, 'system_init', 'Adaptive model retraining', 'Manual model retraining only')
+;
+
+-- Toggle management procedures
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_04_ml.sp_toggle_ml_feature`(
+  feature_name STRING,
+  enable_flag BOOL,
+  modified_by_user STRING
+)
+BEGIN
+  UPDATE `of-scheduler-proj.layer_04_ml.ml_feature_toggles`
+  SET
+    is_enabled = enable_flag,
+    last_modified = CURRENT_TIMESTAMP(),
+    modified_by = modified_by_user
+  WHERE feature_name = feature_name;
+
+  -- Log the toggle change
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'ML_FEATURE_TOGGLE',
+    'layer_04_ml',
+    CONCAT('ML feature ', feature_name, IF(enable_flag, ' enabled', ' disabled')),
+    TO_JSON_STRING(STRUCT(
+      feature_name,
+      enable_flag,
+      modified_by_user
+    ))
+  );
+END;
+
+-- Enhanced recommendation view with toggle support
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_recommendations_with_toggles` AS
+WITH feature_flags AS (
+  SELECT
+    feature_name,
+    is_enabled
+  FROM `of-scheduler-proj.layer_04_ml.ml_feature_toggles`
+),
+
+ml_predictions AS (
+  SELECT
+    r.*,
+
+    -- Use ML predictions only if toggles are enabled
+    CASE
+      WHEN (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_view_rate_prediction')
+      THEN r.predicted_view_rate
+      ELSE r.creator_avg_view_rate_30d  -- Fallback to historical average
+    END AS final_view_rate_prediction,
+
+    CASE
+      WHEN (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_conversion_prediction')
+      THEN r.predicted_conversion_rate
+      ELSE r.creator_avg_conversion_rate_30d  -- Fallback to historical average
+    END AS final_conversion_rate_prediction,
+
+    CASE
+      WHEN (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_enhanced_slot_scoring')
+      THEN r.ml_enhanced_score
+      ELSE `of-scheduler-proj.layer_02_features.udf_slot_score_v1`(
+        r.timing_score,
+        r.recency_score,
+        r.novelty_score,
+        r.price_signal_score
+      )  -- Fallback to original scoring
+    END AS final_slot_score,
+
+    -- Toggle-aware timing optimization
+    CASE
+      WHEN (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_timing_optimization')
+      THEN r.timing_confidence
+      ELSE 0.5  -- Default confidence when ML is disabled
+    END AS final_timing_confidence
+
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest` r
+),
+
+final_recommendations AS (
+  SELECT
+    creator_name,
+    slot_time,
+    slot_display,
+
+    -- Use toggle-aware predictions
+    final_view_rate_prediction AS predicted_view_rate,
+    final_conversion_rate_prediction AS predicted_conversion_rate,
+    final_view_rate_prediction * final_conversion_rate_prediction * 25.0 AS predicted_revenue,
+    final_slot_score AS slot_score,
+    final_timing_confidence AS timing_confidence,
+
+    -- Recalculate rankings based on toggle-aware scores
+    ROW_NUMBER() OVER (ORDER BY final_slot_score DESC) AS global_rank,
+    ROW_NUMBER() OVER (PARTITION BY creator_name ORDER BY final_slot_score DESC) AS creator_rank,
+
+    -- Quality assessment based on active features
+    CASE
+      WHEN final_slot_score > 50 THEN 'EXCELLENT'
+      WHEN final_slot_score > 30 THEN 'GOOD'
+      WHEN final_slot_score > 15 THEN 'FAIR'
+      ELSE 'POOR'
+    END AS recommendation_quality,
+
+    -- Indicate which ML features are active
+    STRUCT(
+      (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_view_rate_prediction') AS view_rate_ml,
+      (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_conversion_prediction') AS conversion_ml,
+      (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_timing_optimization') AS timing_ml,
+      (SELECT is_enabled FROM feature_flags WHERE feature_name = 'ml_enhanced_slot_scoring') AS scoring_ml
+    ) AS active_ml_features
+
+  FROM ml_predictions
+)
+
+SELECT
+  *,
+
+  -- System mode indicator
+  CASE
+    WHEN active_ml_features.view_rate_ml AND active_ml_features.conversion_ml
+         AND active_ml_features.timing_ml AND active_ml_features.scoring_ml
+    THEN 'FULL_ML_MODE'
+    WHEN active_ml_features.view_rate_ml OR active_ml_features.conversion_ml
+         OR active_ml_features.timing_ml OR active_ml_features.scoring_ml
+    THEN 'HYBRID_MODE'
+    ELSE 'FALLBACK_MODE'
+  END AS system_mode
+
+FROM final_recommendations
+WHERE creator_rank <= 10
+ORDER BY slot_score DESC
+;
+
+-- ML System Health Dashboard
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_ml_system_dashboard` AS
+WITH toggle_status AS (
+  SELECT
+    COUNT(*) AS total_features,
+    COUNTIF(is_enabled) AS enabled_features,
+    COUNTIF(NOT is_enabled) AS disabled_features,
+    STRING_AGG(
+      CASE WHEN NOT is_enabled THEN feature_name END, ', '
+    ) AS disabled_feature_list
+  FROM `of-scheduler-proj.layer_04_ml.ml_feature_toggles`
+),
+
+prediction_health AS (
+  SELECT
+    COUNT(*) AS total_predictions,
+    AVG(predicted_view_rate) AS avg_view_rate_pred,
+    AVG(predicted_conversion_rate) AS avg_conversion_pred,
+    AVG(slot_score) AS avg_slot_score,
+    COUNT(DISTINCT creator_name) AS covered_creators,
+    MAX(generated_at) AS latest_prediction_time,
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(generated_at), MINUTE) AS minutes_since_update
+  FROM `of-scheduler-proj.layer_04_ml.v_recommendations_with_toggles`
+),
+
+system_performance AS (
+  SELECT
+    system_mode,
+    COUNT(*) AS recommendation_count,
+    AVG(slot_score) AS avg_score_by_mode,
+    COUNTIF(recommendation_quality = 'EXCELLENT') AS excellent_count
+  FROM `of-scheduler-proj.layer_04_ml.v_recommendations_with_toggles`
+  GROUP BY system_mode
+)
+
+SELECT
+  CURRENT_TIMESTAMP() AS dashboard_timestamp,
+
+  -- Toggle status
+  t.total_features,
+  t.enabled_features,
+  t.disabled_features,
+  t.disabled_feature_list,
+  ROUND(t.enabled_features / t.total_features * 100, 1) AS ml_feature_coverage_percent,
+
+  -- Prediction health
+  p.total_predictions,
+  p.covered_creators,
+  ROUND(p.avg_view_rate_pred, 4) AS avg_view_rate_prediction,
+  ROUND(p.avg_conversion_pred, 4) AS avg_conversion_prediction,
+  ROUND(p.avg_slot_score, 2) AS avg_slot_score,
+  p.latest_prediction_time,
+  p.minutes_since_update,
+
+  -- System performance by mode
+  (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'FULL_ML_MODE') AS full_ml_avg_score,
+  (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'HYBRID_MODE') AS hybrid_avg_score,
+  (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'FALLBACK_MODE') AS fallback_avg_score,
+
+  -- System status
+  CASE
+    WHEN t.enabled_features / t.total_features >= 0.8 AND p.minutes_since_update <= 60
+    THEN '🟢 ML SYSTEM OPTIMAL'
+    WHEN t.enabled_features / t.total_features >= 0.5 AND p.minutes_since_update <= 120
+    THEN '🟡 ML SYSTEM PARTIAL'
+    WHEN t.enabled_features / t.total_features < 0.5
+    THEN '🔴 ML SYSTEM DEGRADED'
+    WHEN p.minutes_since_update > 120
+    THEN '🔴 ML SYSTEM STALE'
+    ELSE '❓ ML SYSTEM UNKNOWN'
+  END AS system_status,
+
+  -- Performance comparison
+  CASE
+    WHEN (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'FULL_ML_MODE') >
+         (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'FALLBACK_MODE') * 1.2
+    THEN '🎯 ML SHOWING SIGNIFICANT IMPROVEMENT'
+    WHEN (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'FULL_ML_MODE') >
+         (SELECT avg_score_by_mode FROM system_performance WHERE system_mode = 'FALLBACK_MODE')
+    THEN '📈 ML SHOWING IMPROVEMENT'
+    ELSE '⚠️ ML PERFORMANCE NEEDS REVIEW'
+  END AS ml_effectiveness
+
+FROM toggle_status t
+CROSS JOIN prediction_health p
+;
+
+-- Emergency ML disable procedure
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_04_ml.sp_emergency_disable_ml`(
+  disabled_by_user STRING,
+  reason STRING
+)
+BEGIN
+  -- Disable all ML features
+  UPDATE `of-scheduler-proj.layer_04_ml.ml_feature_toggles`
+  SET
+    is_enabled = false,
+    last_modified = CURRENT_TIMESTAMP(),
+    modified_by = disabled_by_user;
+
+  -- Log emergency disable
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description,
+    event_data
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'ML_EMERGENCY_DISABLE',
+    'layer_04_ml',
+    CONCAT('Emergency ML disable: ', reason),
+    TO_JSON_STRING(STRUCT(
+      disabled_by_user,
+      reason,
+      'ALL_ML_FEATURES_DISABLED' AS action
+    ))
+  );
+
+  -- Send alert (would integrate with monitoring system)
+  SELECT 'ML SYSTEM EMERGENCY DISABLED' AS alert_message, reason;
+END;
+
+-- ML feature usage analytics
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_ml_feature_usage_analytics` AS
+WITH toggle_history AS (
+  SELECT
+    event_timestamp,
+    JSON_EXTRACT_SCALAR(event_data, '$.feature_name') AS feature_name,
+    JSON_EXTRACT_SCALAR(event_data, '$.enable_flag') = 'true' AS was_enabled,
+    JSON_EXTRACT_SCALAR(event_data, '$.modified_by_user') AS modified_by
+  FROM `of-scheduler-proj.layer_06_monitoring.system_events`
+  WHERE event_type = 'ML_FEATURE_TOGGLE'
+    AND DATE(event_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+),
+
+usage_stats AS (
+  SELECT
+    feature_name,
+    COUNT(*) AS toggle_count,
+    COUNTIF(was_enabled) AS enable_count,
+    COUNTIF(NOT was_enabled) AS disable_count,
+    MAX(event_timestamp) AS last_toggle_time,
+    STRING_AGG(DISTINCT modified_by ORDER BY modified_by) AS users_who_toggled
+  FROM toggle_history
+  GROUP BY feature_name
+),
+
+current_status AS (
+  SELECT
+    feature_name,
+    is_enabled AS currently_enabled,
+    last_modified AS current_status_since
+  FROM `of-scheduler-proj.layer_04_ml.ml_feature_toggles`
+)
+
+SELECT
+  c.feature_name,
+  c.currently_enabled,
+  c.current_status_since,
+  COALESCE(u.toggle_count, 0) AS toggles_last_30d,
+  COALESCE(u.enable_count, 0) AS enables_last_30d,
+  COALESCE(u.disable_count, 0) AS disables_last_30d,
+  u.last_toggle_time,
+  u.users_who_toggled,
+
+  -- Stability indicator
+  CASE
+    WHEN COALESCE(u.toggle_count, 0) = 0 THEN '🟢 STABLE'
+    WHEN COALESCE(u.toggle_count, 0) <= 2 THEN '🟡 OCCASIONAL_CHANGES'
+    ELSE '🔴 FREQUENT_CHANGES'
+  END AS stability_indicator,
+
+  -- Usage pattern
+  CASE
+    WHEN c.currently_enabled AND COALESCE(u.disable_count, 0) = 0 THEN 'CONSISTENTLY_ENABLED'
+    WHEN NOT c.currently_enabled AND COALESCE(u.enable_count, 0) = 0 THEN 'CONSISTENTLY_DISABLED'
+    WHEN COALESCE(u.toggle_count, 0) > 0 THEN 'ACTIVELY_MANAGED'
+    ELSE 'SET_AND_FORGET'
+  END AS usage_pattern
+
+FROM current_status c
+LEFT JOIN usage_stats u ON c.feature_name = u.feature_name
+ORDER BY
+  CASE c.currently_enabled WHEN true THEN 1 ELSE 2 END,
+  COALESCE(u.toggle_count, 0) DESC
+;

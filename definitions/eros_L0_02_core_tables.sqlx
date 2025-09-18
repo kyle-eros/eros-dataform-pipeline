@@ -1,0 +1,370 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L0", "core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L0.02: Core Tables - Smart Data Staging and Master Facts
+-- =====================================================================
+-- Creates staging tables for Gmail ETL ingestion and master fact table
+-- with intelligent deduplication and data quality features.
+-- =====================================================================
+
+-- =====================================================================
+-- STAGING TABLE - Gmail ETL Landing Zone
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_incoming_stage` (
+  -- Core message content
+  message STRING NOT NULL,
+  sending_time STRING,  -- Keep as string for flexible parsing
+  sender STRING NOT NULL,
+  status STRING,
+  price STRING,  -- Keep as string for flexible parsing
+
+  -- Engagement metrics
+  sent INT64,
+  viewed INT64,
+  purchased INT64,
+  earnings NUMERIC,
+
+  -- Administrative fields
+  withdrawn_by STRING,
+  message_id STRING,
+  source_file STRING NOT NULL,
+  loaded_at TIMESTAMP NOT NULL,
+
+  -- Data quality tracking
+  _ingestion_id STRING,
+  _processing_status STRING,
+  _quality_score NUMERIC,
+  _anomaly_flags ARRAY<STRING>
+)
+PARTITION BY DATE(loaded_at)
+CLUSTER BY sender, loaded_at
+OPTIONS (
+  description = "Staging table for Gmail ETL with data quality tracking",
+  partition_expiration_days = 90
+);
+
+-- =====================================================================
+-- MASTER FACT TABLE - Single Source of Truth
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` (
+  -- Deterministic primary key
+  message_row_id STRING NOT NULL,
+
+  -- Core message content (normalized)
+  message STRING NOT NULL,
+  message_hash STRING,  -- SHA256 for content deduplication
+  sending_time TIMESTAMP,
+  sender_original STRING NOT NULL,
+  sender_normalized STRING,  -- Normalized username
+  status STRING,
+  price NUMERIC,
+
+  -- Engagement metrics
+  sent INT64,
+  viewed INT64,
+  purchased INT64,
+  earnings NUMERIC,
+
+  -- Performance metrics (calculated)
+  conversion_rate NUMERIC,  -- purchases / viewed
+  revenue_per_message NUMERIC,  -- earnings / sent
+  engagement_score NUMERIC,  -- Composite score
+
+  -- Content analysis
+  char_length INT64,
+  word_count INT64,
+  emoji_count INT64,
+  has_hashtag BOOL,
+  has_mention BOOL,
+  has_price_placeholder BOOL,
+  has_name_placeholder BOOL,
+
+  -- Timing analysis
+  send_hour INT64,
+  send_dayofweek INT64,
+  send_date DATE,
+  hour_category STRING,  -- MORNING, AFTERNOON, EVENING, NIGHT
+  day_category STRING,   -- WEEKEND, WEEKDAY_EARLY, WEEKDAY_LATE
+
+  -- Administrative and tracking
+  withdrawn_by STRING,
+  message_id_original STRING,
+  source_files ARRAY<STRING>,
+  first_loaded_at TIMESTAMP,
+  last_updated_at TIMESTAMP,
+
+  -- Data lineage and quality
+  ingestion_batch_id STRING,
+  data_quality_score NUMERIC,
+  is_duplicate BOOL,
+  duplicate_group_id STRING,
+  anomaly_flags ARRAY<STRING>,
+
+  -- ML features (pre-computed for serving)
+  creator_tier STRING,  -- PREMIUM, HIGH, MED, LOW, NEW
+  optimal_send_hour INT64,
+  predicted_performance STRING,  -- HIGH, MED, LOW
+  content_category STRING,  -- PPV, BUMP, TIP, CUSTOM
+  novelty_score NUMERIC,
+
+  -- Metadata
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP
+)
+PARTITION BY send_date
+CLUSTER BY sender_normalized, send_date, creator_tier
+OPTIONS (
+  description = "Master fact table for all mass messages with ML features",
+  partition_expiration_days = 1095  -- 3 years
+);
+
+-- =====================================================================
+-- CREATOR WEEKLY AGGREGATES
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.creator_stats_weekly_raw` (
+  week_start_date DATE NOT NULL,
+  username_std STRING NOT NULL,
+  sent INT64,
+  viewed INT64,
+  purchased INT64,
+  earnings NUMERIC,
+
+  -- Calculated metrics
+  conversion_rate NUMERIC,
+  rpm NUMERIC,  -- Revenue per message
+  engagement_rate NUMERIC,
+
+  -- Data lineage
+  source_file STRING,
+  loaded_at TIMESTAMP,
+  created_at TIMESTAMP
+)
+PARTITION BY week_start_date
+CLUSTER BY username_std
+OPTIONS (
+  description = "Weekly creator performance aggregates from external sources"
+);
+
+-- =====================================================================
+-- DEDUPLICATION AND MERGE TRACKING
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.merge_log` (
+  merge_id STRING,
+  merge_timestamp TIMESTAMP,
+  records_processed INT64,
+  records_inserted INT64,
+  records_updated INT64,
+  records_skipped INT64,
+  time_range_start TIMESTAMP,
+  time_range_end TIMESTAMP,
+  processing_duration_seconds NUMERIC,
+  quality_summary STRUCT<
+    avg_quality_score NUMERIC,
+    total_anomalies INT64,
+    duplicate_rate NUMERIC
+  >,
+  status STRING,  -- SUCCESS, FAILED, PARTIAL
+  error_message STRING
+)
+PARTITION BY DATE(merge_timestamp)
+OPTIONS (
+  description = "Audit log for merge operations with performance metrics"
+);
+
+-- =====================================================================
+-- DATA QUALITY TRACKING
+-- =====================================================================
+
+CREATE OR REPLACE TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+  check_timestamp TIMESTAMP,
+  table_name STRING NOT NULL,
+  check_type STRING NOT NULL,  -- COMPLETENESS, ACCURACY, CONSISTENCY, TIMELINESS
+  metric_name STRING NOT NULL,
+  metric_value NUMERIC,
+  threshold_min NUMERIC,
+  threshold_max NUMERIC,
+  status STRING,  -- PASS, WARN, FAIL
+  details JSON,
+  created_at TIMESTAMP
+)
+PARTITION BY DATE(check_timestamp)
+CLUSTER BY table_name, check_type
+OPTIONS (
+  description = "Data quality monitoring with configurable thresholds"
+);
+
+-- =====================================================================
+-- REFERENCE TABLES
+-- =====================================================================
+
+-- Creator tiers and metadata
+CREATE OR REPLACE TABLE `reference.creator_profiles` (
+  username_std STRING NOT NULL,
+  creator_tier STRING,  -- PREMIUM, HIGH, MED, LOW, NEW
+  onboarding_date DATE,
+  status STRING,  -- ACTIVE, INACTIVE, PAUSED
+
+  -- Performance baselines
+  baseline_rpm NUMERIC,
+  baseline_conversion_rate NUMERIC,
+  baseline_sends_per_week INT64,
+
+  -- Content preferences
+  preferred_content_types ARRAY<STRING>,
+  quiet_hours_start INT64,
+  quiet_hours_end INT64,
+
+  -- Scheduling constraints
+  max_sends_per_day INT64,
+  min_hours_between_sends NUMERIC,
+
+  -- Metadata
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP
+)
+CLUSTER BY username_std, creator_tier
+OPTIONS (
+  description = "Creator profiles with performance baselines and constraints"
+);
+
+-- Caption bank for content management
+CREATE OR REPLACE TABLE `reference.caption_bank` (
+  caption_id STRING NOT NULL,  -- SHA256 hash
+  caption_text STRING NOT NULL,
+  caption_type STRING NOT NULL,  -- PPV, BUMP, TIP, RENEW
+
+  -- Content analysis
+  char_len INT64,
+  word_count INT64,
+  emoji_count INT64,
+  has_hashtag BOOL,
+  has_mention BOOL,
+  has_price_placeholder BOOL,
+  has_name_placeholder BOOL,
+
+  -- Classification
+  is_paid BOOL,
+  is_mass_msg BOOL,
+  is_wallpost BOOL,
+
+  -- Performance tracking
+  times_used INT64,
+  total_sends INT64,
+  total_revenue NUMERIC,
+  avg_conversion_rate NUMERIC,
+
+  -- Metadata
+  created_ts TIMESTAMP,
+  last_used_ts TIMESTAMP,
+  source STRING,
+  status STRING,
+
+  -- ML features
+  sentiment_score NUMERIC,
+  urgency_score NUMERIC,
+  personalization_score NUMERIC,
+  novelty_score NUMERIC
+)
+CLUSTER BY caption_type, status
+OPTIONS (
+  description = "Intelligent caption bank with performance tracking and ML scoring"
+);
+
+-- =====================================================================
+-- INDEXES AND CONSTRAINTS
+-- =====================================================================
+
+-- Primary key constraints would be here if BigQuery supported them
+-- Instead, we rely on clustering and partitioning for performance
+
+-- =====================================================================
+-- ROW-LEVEL SECURITY PREPARATION
+-- =====================================================================
+
+-- Create policy tags for data governance (L7 will implement policies)
+-- This sets up the structure for row-level security later
+
+ALTER TABLE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+SET OPTIONS (
+  labels = [
+    ("data_classification", "restricted"),
+    ("contains_pii", "true"),
+    ("retention_policy", "3_years")
+  ]
+);
+
+ALTER TABLE `reference.creator_profiles`
+SET OPTIONS (
+  labels = [
+    ("data_classification", "confidential"),
+    ("business_critical", "true")
+  ]
+);
+
+-- =====================================================================
+-- INITIAL DATA SETUP
+-- =====================================================================
+
+-- Insert default creator tiers
+INSERT INTO `reference.creator_profiles` (
+  username_std,
+  creator_tier,
+  onboarding_date,
+  baseline_rpm,
+  baseline_conversion_rate,
+  max_sends_per_day,
+  min_hours_between_sends
+)
+VALUES
+  -- These will be updated with real data during bootstrap
+  ('default_new_creator', 'NEW', CURRENT_DATE(), 0.25, 0.02, 3, 8.0),
+  ('default_low_creator', 'LOW', CURRENT_DATE(), 0.50, 0.03, 4, 6.0),
+  ('default_med_creator', 'MED', CURRENT_DATE(), 0.75, 0.04, 5, 4.0),
+  ('default_high_creator', 'HIGH', CURRENT_DATE(), 1.25, 0.06, 6, 3.0),
+  ('default_premium_creator', 'PREMIUM', CURRENT_DATE(), 2.00, 0.08, 8, 2.0);
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Create metadata table if it doesn't exist
+CREATE TABLE IF NOT EXISTS `layer_10_metadata.build_log` (
+  layer STRING,
+  component STRING,
+  status STRING,
+  message STRING,
+  created_at TIMESTAMP
+);
+
+-- Log successful initialization (commented out until L10 metadata layer is created)
+/*
+INSERT INTO `layer_10_metadata.build_log` (
+  layer,
+  component,
+  status,
+  message,
+  created_at
+)
+VALUES (
+  'L0',
+  'core_tables',
+  'SUCCESS',
+  'Created staging, master, and reference tables with intelligent features',
+  CURRENT_TIMESTAMP()
+);
+*/
+
+-- Success message
+SELECT
+  'L0.02 COMPLETE' as status,
+  'Created core tables with partitioning, clustering, and quality tracking' as message,
+  CURRENT_TIMESTAMP() as completed_at;

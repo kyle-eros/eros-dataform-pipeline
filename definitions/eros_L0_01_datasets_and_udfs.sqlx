@@ -1,0 +1,357 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L0", "datasets_and_udfs"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L0.01: Datasets and UDFs - Smart Data Foundation
+-- =====================================================================
+-- Creates core datasets and utility functions for the EROS intelligent
+-- scheduling system with BigQuery ML and Vertex AI integration.
+-- =====================================================================
+
+-- Project: of-scheduler-proj
+
+-- =====================================================================
+-- DATASETS CREATION
+-- =====================================================================
+
+-- L0: Raw ingestion and staging
+CREATE SCHEMA IF NOT EXISTS `layer_00_ingestion`
+OPTIONS (
+  description = "Raw data ingestion, staging tables, and initial processing",
+  location = "US"
+);
+
+-- L1: Semantic truth layer
+CREATE SCHEMA IF NOT EXISTS `layer_01_semantic`
+OPTIONS (
+  description = "Business logic layer with stable views, facts, and dimensions",
+  location = "US"
+);
+
+-- L2: Feature engineering
+CREATE SCHEMA IF NOT EXISTS `layer_02_features`
+OPTIONS (
+  description = "Advanced feature engineering for ML and decision making",
+  location = "US"
+);
+
+-- L3: Decision engine
+CREATE SCHEMA IF NOT EXISTS `layer_03_decisions`
+OPTIONS (
+  description = "Core decision engine with A/B testing and recommendations",
+  location = "US"
+);
+
+-- L4: Machine Learning
+CREATE SCHEMA IF NOT EXISTS `layer_04_ml`
+OPTIONS (
+  description = "BigQuery ML models and Vertex AI integration",
+  location = "US"
+);
+
+-- L5: Serving layer
+CREATE SCHEMA IF NOT EXISTS `layer_05_serving`
+OPTIONS (
+  description = "Real-time serving tables for scheduler interfaces",
+  location = "US"
+);
+
+-- L6: Analytics and monitoring
+CREATE SCHEMA IF NOT EXISTS `layer_06_analytics`
+OPTIONS (
+  description = "KPIs, alerts, and performance monitoring",
+  location = "US"
+);
+
+-- L7: Governance and security
+CREATE SCHEMA IF NOT EXISTS `layer_07_governance`
+OPTIONS (
+  description = "Data governance, masking, and access control",
+  location = "US"
+);
+
+-- L8: Experimentation
+CREATE SCHEMA IF NOT EXISTS `layer_08_experiments`
+OPTIONS (
+  description = "A/B testing framework and experiment management",
+  location = "US"
+);
+
+-- L9: Operations
+CREATE SCHEMA IF NOT EXISTS `layer_09_operations`
+OPTIONS (
+  description = "Lifecycle management, backfills, and maintenance",
+  location = "US"
+);
+
+-- L10: Metadata
+CREATE SCHEMA IF NOT EXISTS `layer_10_metadata`
+OPTIONS (
+  description = "Data catalog, documentation, and lineage",
+  location = "US"
+);
+
+-- Reference data
+CREATE SCHEMA IF NOT EXISTS `reference`
+OPTIONS (
+  description = "Reference data and lookup tables",
+  location = "US"
+);
+
+-- =====================================================================
+-- CORE UTILITY FUNCTIONS
+-- =====================================================================
+
+-- Username normalization function (mirrors Python cleaner)
+CREATE OR REPLACE FUNCTION `${dataform.projectConfig.defaultProject}.layer_00_ingestion.normalize_username`(input_text STRING)
+RETURNS STRING
+LANGUAGE js AS """
+  if (!input_text) return null;
+
+  return input_text
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+""";
+
+-- Safe numeric conversion with fallback
+CREATE OR REPLACE FUNCTION `${dataform.projectConfig.defaultProject}.layer_00_ingestion.safe_numeric`(input_text STRING)
+RETURNS NUMERIC
+LANGUAGE js AS """
+  if (!input_text) return null;
+
+  const cleaned = input_text.replace(/[^0-9.-]/g, '');
+  const num = parseFloat(cleaned);
+
+  return isNaN(num) ? null : BigQuery.utils.numericValue(num.toString());
+""";
+
+-- Safe integer conversion
+CREATE OR REPLACE FUNCTION `${dataform.projectConfig.defaultProject}.layer_00_ingestion.safe_integer`(input_text STRING)
+RETURNS INT64
+LANGUAGE js AS """
+  if (!input_text) return null;
+
+  const cleaned = input_text.replace(/[^0-9-]/g, '');
+  const num = parseInt(cleaned, 10);
+
+  return isNaN(num) ? null : Number(num);
+""";
+
+-- Extract price from text (handles $5, $10.50, {{price}}, etc.)
+CREATE OR REPLACE FUNCTION `layer_02_features.extract_price`(text STRING)
+RETURNS NUMERIC
+LANGUAGE js AS """
+  if (!text) return null;
+
+  // Look for dollar amounts like $5, $10.50
+  const dollarMatch = text.match(/\\$([0-9]+(?:\\.[0-9]{2})?)/);
+  if (dollarMatch) {
+    return BigQuery.utils.numericValue(parseFloat(dollarMatch[1]).toString());
+  }
+
+  // Look for just numbers
+  const numberMatch = text.match(/([0-9]+(?:\\.[0-9]{2})?)/);
+  if (numberMatch) {
+    return BigQuery.utils.numericValue(parseFloat(numberMatch[1]).toString());
+  }
+
+  return null;
+""";
+
+-- Content analysis functions for caption intelligence
+CREATE OR REPLACE FUNCTION `layer_02_features.count_emojis`(text STRING)
+RETURNS INT64
+LANGUAGE js AS """
+  if (!text) return 0;
+
+  // Unicode emoji ranges
+  const emojiRegex = /[\\u{1F600}-\\u{1F64F}]|[\\u{1F300}-\\u{1F5FF}]|[\\u{1F680}-\\u{1F6FF}]|[\\u{1F1E0}-\\u{1F1FF}]|[\\u{2600}-\\u{26FF}]|[\\u{2700}-\\u{27BF}]/gu;
+
+  const matches = text.match(emojiRegex);
+  return matches ? matches.length : 0;
+""";
+
+CREATE OR REPLACE FUNCTION `layer_02_features.has_placeholder`(text STRING, placeholder_type STRING)
+RETURNS BOOL
+LANGUAGE js AS """
+  if (!text) return false;
+
+  const patterns = {
+    'price': /\\{\\{price\\}\\}|\\$\\s*[0-9]+(\\.[0-9]{2})?/i,
+    'name': /\\{\\{name\\}\\}|\\{\\{username\\}\\}/i,
+    'hashtag': /#[a-zA-Z0-9_]+/,
+    'mention': /@[a-zA-Z0-9_]+/
+  };
+
+  const pattern = patterns[placeholder_type.toLowerCase()];
+  return pattern ? pattern.test(text) : false;
+""";
+
+-- Time-based utility functions
+CREATE OR REPLACE FUNCTION `layer_02_features.hour_category`(hour INT64)
+RETURNS STRING AS (
+  CASE
+    WHEN hour BETWEEN 6 AND 11 THEN 'MORNING'
+    WHEN hour BETWEEN 12 AND 17 THEN 'AFTERNOON'
+    WHEN hour BETWEEN 18 AND 22 THEN 'EVENING'
+    ELSE 'NIGHT'
+  END
+);
+
+CREATE OR REPLACE FUNCTION `layer_02_features.day_category`(dayofweek INT64)
+RETURNS STRING AS (
+  CASE
+    WHEN dayofweek IN (1, 7) THEN 'WEEKEND'  -- Sunday=1, Saturday=7
+    WHEN dayofweek IN (2, 3, 4) THEN 'WEEKDAY_EARLY'
+    ELSE 'WEEKDAY_LATE'  -- Thursday, Friday
+  END
+);
+
+-- Revenue calculation helpers
+CREATE OR REPLACE FUNCTION `layer_02_features.calculate_rpm`(revenue NUMERIC, messages_sent INT64)
+RETURNS NUMERIC AS (
+  CASE
+    WHEN messages_sent > 0 THEN ROUND(revenue / messages_sent, 4)
+    ELSE NULL
+  END
+);
+
+CREATE OR REPLACE FUNCTION `layer_02_features.conversion_rate`(purchases INT64, views INT64)
+RETURNS NUMERIC AS (
+  CASE
+    WHEN views > 0 THEN CAST(ROUND(purchases / views, 4) AS NUMERIC)
+    ELSE NULL
+  END
+);
+
+-- =====================================================================
+-- ADVANCED ML UTILITY FUNCTIONS
+-- =====================================================================
+
+-- Fan segmentation helper (for BQML)
+CREATE OR REPLACE FUNCTION `layer_04_ml.fan_engagement_score`(
+  total_purchases INT64,
+  total_spent NUMERIC,
+  days_active INT64,
+  avg_response_time_hours NUMERIC
+)
+RETURNS NUMERIC AS (
+  -- Weighted engagement score for fan segmentation
+  CASE
+    WHEN total_purchases IS NULL OR total_spent IS NULL OR days_active IS NULL THEN NULL
+    ELSE
+      CAST((COALESCE(total_purchases, 0) * 0.3) +
+      (LEAST(COALESCE(total_spent, 0) / 100, 10) * 0.4) +  -- Cap at $1000 = 10 points
+      (LEAST(COALESCE(days_active, 0) / 30, 12) * 0.2) +   -- Cap at 1 year = 12 points
+      (CASE
+         WHEN avg_response_time_hours <= 1 THEN 1.0
+         WHEN avg_response_time_hours <= 6 THEN 0.7
+         WHEN avg_response_time_hours <= 24 THEN 0.4
+         ELSE 0.1
+       END * 0.1) AS NUMERIC)
+  END
+);
+
+-- Price band calculator
+CREATE OR REPLACE FUNCTION `layer_02_features.price_band`(
+  creator_username STRING,
+  base_rpm NUMERIC,
+  creator_tier STRING
+)
+RETURNS STRING AS (
+  CASE
+    WHEN base_rpm IS NULL THEN 'UNKNOWN'
+    WHEN creator_tier = 'PREMIUM' THEN
+      CASE
+        WHEN base_rpm >= 2.0 THEN 'PREMIUM'
+        WHEN base_rpm >= 1.0 THEN 'HIGH'
+        WHEN base_rpm >= 0.5 THEN 'MED'
+        ELSE 'LOW'
+      END
+    WHEN creator_tier = 'HIGH' THEN
+      CASE
+        WHEN base_rpm >= 1.5 THEN 'HIGH'
+        WHEN base_rpm >= 0.75 THEN 'MED'
+        ELSE 'LOW'
+      END
+    ELSE  -- MED, LOW, or NEW creators
+      CASE
+        WHEN base_rpm >= 1.0 THEN 'MED'
+        WHEN base_rpm >= 0.5 THEN 'LOW'
+        ELSE 'LOW'
+      END
+  END
+);
+
+-- Fatigue penalty calculator
+CREATE OR REPLACE FUNCTION `layer_02_features.fatigue_penalty`(
+  hours_since_last NUMERIC,
+  sends_last_24h INT64,
+  creator_tier STRING
+)
+RETURNS NUMERIC AS (
+  CAST((CASE
+    WHEN hours_since_last IS NULL THEN 0.0
+    -- High penalty for sending too frequently
+    WHEN hours_since_last < 2 THEN 0.1  -- 90% penalty
+    WHEN hours_since_last < 4 THEN 0.3  -- 70% penalty
+    WHEN hours_since_last < 8 THEN 0.6  -- 40% penalty
+    WHEN hours_since_last < 12 THEN 0.8 -- 20% penalty
+    -- Bonus for good spacing
+    WHEN hours_since_last BETWEEN 12 AND 72 THEN 1.0  -- Optimal
+    -- Slight penalty for waiting too long
+    WHEN hours_since_last > 168 THEN 0.9  -- 1 week+
+    ELSE 0.95
+  END *
+  -- Additional penalty based on recent volume
+  CASE
+    WHEN sends_last_24h >= 6 THEN 0.5  -- Too many sends
+    WHEN sends_last_24h >= 4 THEN 0.7
+    WHEN sends_last_24h >= 3 THEN 0.85
+    WHEN sends_last_24h >= 2 THEN 0.95
+    ELSE 1.0
+  END) AS NUMERIC)
+);
+
+-- =====================================================================
+-- VERTEX AI INTEGRATION SETUP
+-- =====================================================================
+
+-- Connection for Vertex AI (requires manual setup in console)
+-- This enables BQML to use Vertex AI models
+-- CREATE OR REPLACE EXTERNAL TABLE `layer_04_ml.vertex_ai_connection`
+-- (Note: This requires manual setup through BigQuery console or gcloud CLI)
+
+-- =====================================================================
+-- LOGGING AND METADATA
+-- =====================================================================
+
+-- Log successful initialization (commented out until L10 metadata layer is created)
+/*
+INSERT INTO `layer_10_metadata.build_log` (
+  layer,
+  component,
+  status,
+  message,
+  created_at
+)
+VALUES (
+  'L0',
+  'datasets_and_udfs',
+  'SUCCESS',
+  'Created 11 datasets and 15 utility functions for EROS intelligent scheduling',
+  CURRENT_TIMESTAMP()
+);
+*/
+
+-- Success message
+SELECT
+  'L0.01 COMPLETE' as status,
+  'Created datasets and UDFs for EROS intelligent scheduling system' as message,
+  CURRENT_TIMESTAMP() as completed_at;

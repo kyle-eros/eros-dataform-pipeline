@@ -1,0 +1,631 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L2", "heatmaps"],
+  dependencies: ["eros_L1_01_reference_enums", "eros_L1_02_v_message_facts_by_page"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L2.02: Intelligent Heatmaps - AI-Powered Timing Optimization
+-- =====================================================================
+-- Advanced heatmap analysis with fan segmentation, seasonal patterns,
+-- and predictive timing recommendations for optimal engagement.
+-- =====================================================================
+
+-- =====================================================================
+-- HOURLY ENGAGEMENT HEATMAP VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_02_features.v_hourly_engagement_heatmap` AS
+WITH hourly_base AS (
+  -- Base hourly performance metrics
+  SELECT
+    creator_username,
+    creator_tier,
+    send_hour,
+    EXTRACT(DAYOFWEEK FROM send_date) AS day_of_week,
+    day_category,
+
+    -- Volume metrics
+    COUNT(*) AS total_messages,
+    COUNT(DISTINCT send_date) AS active_days,
+
+    -- Performance metrics
+    SUM(sent) AS total_sent,
+    SUM(viewed) AS total_viewed,
+    SUM(purchased) AS total_purchased,
+    SUM(earnings) AS total_earnings,
+
+    -- Calculated performance
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement_score,
+
+    -- Quality metrics
+    AVG(novelty_score) AS avg_novelty,
+    COUNTIF(performance_classification = 'HIGH_PERFORMER') AS high_performance_count,
+
+    -- Fan context
+    MAX(estimated_fan_count) AS estimated_fan_count
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    AND send_hour IS NOT NULL
+  GROUP BY creator_username, creator_tier, send_hour, day_of_week, day_category
+),
+
+hourly_enhanced AS (
+  -- Enhanced metrics with statistical analysis
+  SELECT
+    hb.*,
+
+    -- Statistical reliability
+    CASE
+      WHEN total_messages >= 10 AND active_days >= 5 THEN 'HIGH'
+      WHEN total_messages >= 5 AND active_days >= 3 THEN 'MEDIUM'
+      WHEN total_messages >= 3 THEN 'LOW'
+      ELSE 'INSUFFICIENT'
+    END AS reliability_level,
+
+    -- Performance vs creator baseline
+    avg_conversion_rate / NULLIF((
+      SELECT AVG(conversion_rate)
+      FROM `layer_01_semantic.v_message_facts_by_page` baseline
+      WHERE baseline.creator_username = hb.creator_username
+        AND baseline.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    ), 0) AS conversion_vs_baseline,
+
+    avg_rpm / NULLIF((
+      SELECT AVG(revenue_per_message)
+      FROM `layer_01_semantic.v_message_facts_by_page` baseline
+      WHERE baseline.creator_username = hb.creator_username
+        AND baseline.send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    ), 0) AS rpm_vs_baseline,
+
+    -- Hour performance ranking within creator
+    RANK() OVER (
+      PARTITION BY creator_username
+      ORDER BY avg_rpm DESC, avg_conversion_rate DESC
+    ) AS hour_performance_rank,
+
+    -- Percentile within creator's hours
+    PERCENT_RANK() OVER (
+      PARTITION BY creator_username
+      ORDER BY avg_rpm
+    ) AS rpm_percentile_rank,
+
+    -- Volume intensity
+    total_messages / GREATEST(active_days, 1) AS avg_messages_per_day,
+
+    -- Engagement efficiency
+    COALESCE(total_viewed / NULLIF(total_sent, 0), 0) AS view_rate,
+    COALESCE(total_purchased / NULLIF(total_viewed, 0), 0) AS purchase_rate
+
+  FROM hourly_base hb
+),
+
+hour_classification AS (
+  -- Classify each hour's performance
+  SELECT
+    he.*,
+
+    -- Performance tier for this hour
+    CASE
+      WHEN rpm_percentile_rank >= 0.8 AND reliability_level IN ('HIGH', 'MEDIUM') THEN 'PEAK'
+      WHEN rpm_percentile_rank >= 0.6 AND reliability_level IN ('HIGH', 'MEDIUM') THEN 'STRONG'
+      WHEN rpm_percentile_rank >= 0.4 THEN 'AVERAGE'
+      WHEN rpm_percentile_rank >= 0.2 THEN 'WEAK'
+      ELSE 'POOR'
+    END AS hour_performance_tier,
+
+    -- Strategic classification
+    CASE
+      WHEN avg_rpm >= 2.0 AND conversion_vs_baseline >= 1.2 THEN 'GOLDEN_HOUR'
+      WHEN avg_rpm >= 1.5 AND conversion_vs_baseline >= 1.0 THEN 'PRIME_TIME'
+      WHEN avg_rpm >= 1.0 AND conversion_vs_baseline >= 0.8 THEN 'GOOD_WINDOW'
+      WHEN avg_rpm >= 0.5 THEN 'ACCEPTABLE'
+      ELSE 'AVOID'
+    END AS strategic_classification,
+
+    -- Volume opportunity
+    CASE
+      WHEN hour_performance_rank <= 3 AND avg_messages_per_day < 2 THEN 'UNDERUTILIZED'
+      WHEN hour_performance_rank <= 5 AND avg_messages_per_day < 1 THEN 'OPPORTUNITY'
+      WHEN hour_performance_rank > 15 AND avg_messages_per_day >= 1 THEN 'OVERUSED'
+      ELSE 'BALANCED'
+    END AS volume_opportunity,
+
+    -- Confidence score (0-1)
+    LEAST(1.0, (
+      CASE reliability_level
+        WHEN 'HIGH' THEN 0.4
+        WHEN 'MEDIUM' THEN 0.3
+        WHEN 'LOW' THEN 0.2
+        ELSE 0.1
+      END +
+      LEAST(0.3, total_messages / 50.0) +  -- Message volume component
+      LEAST(0.3, active_days / 30.0)       -- Day coverage component
+    )) AS confidence_score
+
+  FROM hourly_enhanced he
+)
+
+-- Main heatmap view
+SELECT
+  creator_username,
+  creator_tier,
+  send_hour,
+  day_of_week,
+  day_category,
+
+  -- Volume data
+  total_messages,
+  active_days,
+  ROUND(avg_messages_per_day, 2) AS avg_messages_per_day,
+
+  -- Performance metrics
+  total_sent,
+  total_viewed,
+  total_purchased,
+  ROUND(total_earnings, 2) AS total_earnings,
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+  ROUND(avg_engagement_score, 4) AS avg_engagement_score,
+
+  -- Calculated rates
+  ROUND(view_rate, 4) AS view_rate,
+  ROUND(purchase_rate, 4) AS purchase_rate,
+
+  -- Baseline comparisons
+  ROUND(conversion_vs_baseline, 3) AS conversion_vs_baseline,
+  ROUND(rpm_vs_baseline, 3) AS rpm_vs_baseline,
+
+  -- Rankings and performance
+  hour_performance_rank,
+  ROUND(rpm_percentile_rank, 3) AS rpm_percentile_rank,
+  hour_performance_tier,
+  strategic_classification,
+  volume_opportunity,
+
+  -- Quality metrics
+  ROUND(avg_novelty, 3) AS avg_novelty,
+  high_performance_count,
+  reliability_level,
+  ROUND(confidence_score, 3) AS confidence_score,
+
+  -- Recommendations
+  CASE
+    WHEN strategic_classification = 'GOLDEN_HOUR' THEN 'MAXIMIZE_USAGE'
+    WHEN strategic_classification = 'PRIME_TIME' THEN 'INCREASE_FREQUENCY'
+    WHEN strategic_classification = 'GOOD_WINDOW' THEN 'MAINTAIN_USAGE'
+    WHEN strategic_classification = 'ACCEPTABLE' AND volume_opportunity = 'UNDERUTILIZED' THEN 'TEST_EXPANSION'
+    WHEN strategic_classification = 'AVOID' THEN 'MINIMIZE_USAGE'
+    ELSE 'MONITOR_PERFORMANCE'
+  END AS usage_recommendation,
+
+  estimated_fan_count,
+  CURRENT_TIMESTAMP() AS heatmap_calculated_at
+
+FROM hour_classification
+ORDER BY creator_username, send_hour;
+
+-- =====================================================================
+-- FAN SEGMENT HEATMAP VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_02_features.v_fan_segment_heatmap` AS
+WITH segment_timing AS (
+  -- Simulate fan segment activity patterns
+  SELECT
+    creator_username,
+    send_hour,
+    EXTRACT(DAYOFWEEK FROM send_date) AS day_of_week,
+
+    -- Simulate different fan segments based on timing patterns
+    CASE
+      WHEN send_hour BETWEEN 22 AND 6 THEN 'NIGHT_OWLS'
+      WHEN send_hour BETWEEN 10 AND 16 AND EXTRACT(DAYOFWEEK FROM send_date) NOT IN (1, 7) THEN 'BROWSERS'
+      WHEN earnings > avg_rpm * 1.5 THEN 'WHALES'
+      WHEN total_purchased > 0 AND conversion_rate > 0.05 THEN 'LOYALISTS'
+      ELSE 'TEASERS'
+    END AS estimated_fan_segment,
+
+    -- Performance metrics
+    COUNT(*) AS message_count,
+    SUM(earnings) AS total_earnings,
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    SUM(purchased) AS total_purchases,
+    AVG(engagement_score) AS avg_engagement
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    AND send_hour IS NOT NULL
+  GROUP BY creator_username, send_hour, day_of_week, estimated_fan_segment
+),
+
+segment_analysis AS (
+  -- Analyze segment performance by time
+  SELECT
+    creator_username,
+    estimated_fan_segment,
+    send_hour,
+    day_of_week,
+
+    -- Aggregated metrics
+    SUM(message_count) AS total_messages,
+    SUM(total_earnings) AS segment_earnings,
+    AVG(avg_conversion_rate) AS segment_conversion_rate,
+    AVG(avg_rpm) AS segment_rpm,
+    SUM(total_purchases) AS segment_purchases,
+
+    -- Segment timing preferences
+    RANK() OVER (
+      PARTITION BY creator_username, estimated_fan_segment
+      ORDER BY AVG(avg_rpm) DESC
+    ) AS hour_preference_rank,
+
+    -- Performance percentiles within segment
+    PERCENT_RANK() OVER (
+      PARTITION BY creator_username, estimated_fan_segment
+      ORDER BY AVG(avg_rpm)
+    ) AS segment_hour_percentile
+
+  FROM segment_timing
+  GROUP BY creator_username, estimated_fan_segment, send_hour, day_of_week
+),
+
+segment_recommendations AS (
+  -- Generate segment-specific recommendations
+  SELECT
+    sa.*,
+
+    -- Optimal timing classification
+    CASE
+      WHEN hour_preference_rank <= 3 AND segment_hour_percentile >= 0.7 THEN 'OPTIMAL'
+      WHEN hour_preference_rank <= 5 AND segment_hour_percentile >= 0.5 THEN 'GOOD'
+      WHEN hour_preference_rank <= 8 AND segment_hour_percentile >= 0.3 THEN 'ACCEPTABLE'
+      ELSE 'SUBOPTIMAL'
+    END AS timing_rating,
+
+    -- Segment-specific insights
+    CASE estimated_fan_segment
+      WHEN 'WHALES' THEN
+        CASE
+          WHEN segment_rpm >= 3.0 THEN 'PREMIUM_PRICING_OPPORTUNITY'
+          WHEN segment_conversion_rate >= 0.12 THEN 'HIGH_ENGAGEMENT_WINDOW'
+          ELSE 'MAINTAIN_QUALITY'
+        END
+      WHEN 'NIGHT_OWLS' THEN
+        CASE
+          WHEN send_hour BETWEEN 22 AND 2 THEN 'PRIME_NIGHT_WINDOW'
+          WHEN send_hour BETWEEN 3 AND 6 THEN 'LATE_NIGHT_OPPORTUNITY'
+          ELSE 'OFF_PEAK_TIMING'
+        END
+      WHEN 'LOYALISTS' THEN
+        CASE
+          WHEN segment_conversion_rate >= 0.08 THEN 'LOYAL_ENGAGEMENT_PEAK'
+          WHEN total_messages >= 10 THEN 'PROVEN_TIME_SLOT'
+          ELSE 'BUILD_CONSISTENCY'
+        END
+      WHEN 'BROWSERS' THEN
+        CASE
+          WHEN segment_conversion_rate >= 0.03 THEN 'CONVERSION_OPPORTUNITY'
+          WHEN total_messages >= 5 THEN 'BROWSER_ACTIVE_PERIOD'
+          ELSE 'NURTURE_WINDOW'
+        END
+      ELSE 'GENERAL_AUDIENCE'
+    END AS segment_insight
+
+  FROM segment_analysis sa
+)
+
+SELECT
+  creator_username,
+  estimated_fan_segment,
+  send_hour,
+  day_of_week,
+
+  -- Volume and performance
+  total_messages,
+  ROUND(segment_earnings, 2) AS segment_earnings,
+  ROUND(segment_conversion_rate, 4) AS segment_conversion_rate,
+  ROUND(segment_rpm, 4) AS segment_rpm,
+  segment_purchases,
+
+  -- Timing analysis
+  hour_preference_rank,
+  ROUND(segment_hour_percentile, 3) AS segment_hour_percentile,
+  timing_rating,
+
+  -- Strategic insights
+  segment_insight,
+
+  -- Recommendations
+  CASE
+    WHEN timing_rating = 'OPTIMAL' AND estimated_fan_segment IN ('WHALES', 'LOYALISTS') THEN 'SCALE_PREMIUM_CONTENT'
+    WHEN timing_rating = 'OPTIMAL' THEN 'MAXIMIZE_THIS_TIME_SLOT'
+    WHEN timing_rating = 'GOOD' THEN 'INCREASE_FREQUENCY'
+    WHEN timing_rating = 'ACCEPTABLE' THEN 'MAINTAIN_OR_TEST'
+    ELSE 'CONSIDER_ALTERNATIVE_TIMING'
+  END AS segment_recommendation,
+
+  CURRENT_TIMESTAMP() AS segment_heatmap_calculated_at
+
+FROM segment_recommendations
+ORDER BY creator_username, estimated_fan_segment, hour_preference_rank;
+
+-- =====================================================================
+-- SEASONAL PERFORMANCE HEATMAP VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_02_features.v_seasonal_heatmap` AS
+WITH seasonal_base AS (
+  -- Base seasonal analysis
+  SELECT
+    creator_username,
+    creator_tier,
+    EXTRACT(MONTH FROM send_date) AS month_of_year,
+    EXTRACT(WEEK FROM send_date) AS week_of_year,
+    EXTRACT(DAYOFWEEK FROM send_date) AS day_of_week,
+    send_hour,
+
+    -- Seasonal categories
+    CASE
+      WHEN EXTRACT(MONTH FROM send_date) IN (12, 1, 2) THEN 'WINTER'
+      WHEN EXTRACT(MONTH FROM send_date) IN (3, 4, 5) THEN 'SPRING'
+      WHEN EXTRACT(MONTH FROM send_date) IN (6, 7, 8) THEN 'SUMMER'
+      ELSE 'FALL'
+    END AS season,
+
+    CASE
+      WHEN EXTRACT(DAYOFWEEK FROM send_date) IN (1, 7) THEN 'WEEKEND'
+      ELSE 'WEEKDAY'
+    END AS week_part,
+
+    -- Performance metrics
+    COUNT(*) AS message_count,
+    SUM(earnings) AS total_earnings,
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+  GROUP BY creator_username, creator_tier, month_of_year, week_of_year,
+           day_of_week, send_hour, season, week_part
+),
+
+seasonal_trends AS (
+  -- Identify seasonal trends
+  SELECT
+    creator_username,
+    season,
+    week_part,
+    send_hour,
+
+    -- Aggregated seasonal performance
+    SUM(message_count) AS seasonal_messages,
+    SUM(total_earnings) AS seasonal_earnings,
+    AVG(avg_conversion_rate) AS seasonal_conversion_rate,
+    AVG(avg_rpm) AS seasonal_rpm,
+
+    -- Seasonal ranking
+    RANK() OVER (
+      PARTITION BY creator_username
+      ORDER BY AVG(avg_rpm) DESC
+    ) AS seasonal_performance_rank,
+
+    -- Year-over-year comparison (if available)
+    LAG(AVG(avg_rpm), 4) OVER (
+      PARTITION BY creator_username, send_hour
+      ORDER BY season
+    ) AS yoy_rpm_comparison,
+
+    -- Trend indicators
+    CORR(week_of_year, avg_rpm) OVER (
+      PARTITION BY creator_username, season
+    ) AS seasonal_trend_correlation
+
+  FROM seasonal_base
+  GROUP BY creator_username, season, week_part, send_hour
+),
+
+seasonal_insights AS (
+  -- Generate seasonal insights
+  SELECT
+    st.*,
+
+    -- Seasonal strength
+    CASE
+      WHEN seasonal_performance_rank <= 2 THEN 'PEAK_SEASON'
+      WHEN seasonal_performance_rank <= 4 THEN 'STRONG_SEASON'
+      WHEN seasonal_performance_rank = 5 THEN 'AVERAGE_SEASON'
+      ELSE 'WEAK_SEASON'
+    END AS seasonal_strength,
+
+    -- Trend direction
+    CASE
+      WHEN seasonal_trend_correlation >= 0.3 THEN 'IMPROVING'
+      WHEN seasonal_trend_correlation <= -0.3 THEN 'DECLINING'
+      ELSE 'STABLE'
+    END AS seasonal_trend,
+
+    -- YoY comparison
+    CASE
+      WHEN yoy_rpm_comparison IS NOT NULL THEN
+        (seasonal_rpm - yoy_rpm_comparison) / NULLIF(yoy_rpm_comparison, 0)
+      ELSE NULL
+    END AS yoy_growth_rate
+
+  FROM seasonal_trends st
+)
+
+SELECT
+  creator_username,
+  season,
+  week_part,
+  send_hour,
+
+  -- Volume and performance
+  seasonal_messages,
+  ROUND(seasonal_earnings, 2) AS seasonal_earnings,
+  ROUND(seasonal_conversion_rate, 4) AS seasonal_conversion_rate,
+  ROUND(seasonal_rpm, 4) AS seasonal_rpm,
+
+  -- Seasonal analysis
+  seasonal_performance_rank,
+  seasonal_strength,
+  seasonal_trend,
+  ROUND(seasonal_trend_correlation, 3) AS trend_correlation,
+
+  -- Year-over-year
+  ROUND(yoy_growth_rate, 3) AS yoy_growth_rate,
+
+  -- Strategic recommendations
+  CASE
+    WHEN seasonal_strength = 'PEAK_SEASON' AND seasonal_trend = 'IMPROVING' THEN 'MAXIMIZE_SEASONAL_OPPORTUNITY'
+    WHEN seasonal_strength = 'PEAK_SEASON' THEN 'LEVERAGE_SEASONAL_STRENGTH'
+    WHEN seasonal_strength = 'WEAK_SEASON' AND seasonal_trend = 'IMPROVING' THEN 'BUILD_SEASONAL_MOMENTUM'
+    WHEN seasonal_strength = 'WEAK_SEASON' THEN 'MINIMIZE_OR_PIVOT'
+    ELSE 'MAINTAIN_SEASONAL_STRATEGY'
+  END AS seasonal_recommendation,
+
+  CURRENT_TIMESTAMP() AS seasonal_calculated_at
+
+FROM seasonal_insights
+ORDER BY creator_username, seasonal_performance_rank;
+
+-- =====================================================================
+-- PREDICTIVE TIMING RECOMMENDATIONS VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_02_features.v_predictive_timing_recommendations` AS
+WITH timing_intelligence AS (
+  -- Combine all heatmap intelligence
+  SELECT
+    h.creator_username,
+    h.creator_tier,
+    h.send_hour,
+    h.day_of_week,
+
+    -- Hourly performance
+    h.strategic_classification,
+    h.confidence_score AS hourly_confidence,
+    h.rpm_vs_baseline,
+    h.usage_recommendation,
+
+    -- Fan segment alignment
+    COUNT(DISTINCT fs.estimated_fan_segment) AS aligned_segments,
+    AVG(CASE WHEN fs.timing_rating IN ('OPTIMAL', 'GOOD') THEN 1.0 ELSE 0.0 END) AS segment_alignment_score,
+
+    -- Seasonal context
+    MAX(s.seasonal_strength) AS seasonal_context,
+    MAX(s.seasonal_trend) AS seasonal_trend,
+
+    -- Composite opportunity score
+    (
+      CASE h.strategic_classification
+        WHEN 'GOLDEN_HOUR' THEN 1.0
+        WHEN 'PRIME_TIME' THEN 0.8
+        WHEN 'GOOD_WINDOW' THEN 0.6
+        WHEN 'ACCEPTABLE' THEN 0.4
+        ELSE 0.2
+      END * 0.4 +
+      h.confidence_score * 0.3 +
+      AVG(CASE WHEN fs.timing_rating IN ('OPTIMAL', 'GOOD') THEN 1.0 ELSE 0.0 END) * 0.2 +
+      CASE MAX(s.seasonal_strength)
+        WHEN 'PEAK_SEASON' THEN 1.0
+        WHEN 'STRONG_SEASON' THEN 0.8
+        WHEN 'AVERAGE_SEASON' THEN 0.6
+        ELSE 0.4
+      END * 0.1
+    ) AS composite_opportunity_score
+
+  FROM `layer_02_features.v_hourly_engagement_heatmap` h
+  LEFT JOIN `layer_02_features.v_fan_segment_heatmap` fs
+    ON h.creator_username = fs.creator_username
+    AND h.send_hour = fs.send_hour
+    AND h.day_of_week = fs.day_of_week
+  LEFT JOIN `layer_02_features.v_seasonal_heatmap` s
+    ON h.creator_username = s.creator_username
+    AND h.send_hour = s.send_hour
+  GROUP BY h.creator_username, h.creator_tier, h.send_hour, h.day_of_week,
+           h.strategic_classification, h.confidence_score, h.rpm_vs_baseline, h.usage_recommendation
+)
+
+SELECT
+  creator_username,
+  creator_tier,
+  send_hour,
+  day_of_week,
+
+  -- Performance indicators
+  strategic_classification,
+  ROUND(hourly_confidence, 3) AS confidence_score,
+  ROUND(rpm_vs_baseline, 3) AS performance_vs_baseline,
+
+  -- Alignment scores
+  aligned_segments,
+  ROUND(segment_alignment_score, 3) AS segment_alignment_score,
+  seasonal_context,
+  seasonal_trend,
+
+  -- Composite scoring
+  ROUND(composite_opportunity_score, 3) AS opportunity_score,
+
+  -- Priority classification
+  CASE
+    WHEN composite_opportunity_score >= 0.8 THEN 'PRIORITY_1_GOLDEN'
+    WHEN composite_opportunity_score >= 0.7 THEN 'PRIORITY_2_EXCELLENT'
+    WHEN composite_opportunity_score >= 0.6 THEN 'PRIORITY_3_STRONG'
+    WHEN composite_opportunity_score >= 0.5 THEN 'PRIORITY_4_GOOD'
+    WHEN composite_opportunity_score >= 0.4 THEN 'PRIORITY_5_ACCEPTABLE'
+    ELSE 'PRIORITY_6_AVOID'
+  END AS priority_tier,
+
+  -- Strategic recommendations
+  CASE
+    WHEN composite_opportunity_score >= 0.8 AND hourly_confidence >= 0.7 THEN 'MAXIMIZE_IMMEDIATELY'
+    WHEN composite_opportunity_score >= 0.7 THEN 'SCALE_STRATEGICALLY'
+    WHEN composite_opportunity_score >= 0.6 THEN 'INCREASE_USAGE'
+    WHEN composite_opportunity_score >= 0.5 THEN 'MAINTAIN_CURRENT'
+    WHEN composite_opportunity_score >= 0.4 THEN 'TEST_CAUTIOUSLY'
+    ELSE 'AVOID_OR_MINIMIZE'
+  END AS strategic_recommendation,
+
+  -- Action items
+  ARRAY_CONCAT(
+    CASE WHEN strategic_classification = 'GOLDEN_HOUR' THEN ['golden_hour_opportunity'] ELSE [] END,
+    CASE WHEN segment_alignment_score >= 0.8 THEN ['high_fan_alignment'] ELSE [] END,
+    CASE WHEN seasonal_context = 'PEAK_SEASON' THEN ['seasonal_advantage'] ELSE [] END,
+    CASE WHEN hourly_confidence < 0.5 THEN ['needs_more_data'] ELSE [] END,
+    CASE WHEN rpm_vs_baseline < 0.8 THEN ['underperforming_baseline'] ELSE [] END
+  ) AS optimization_flags,
+
+  CURRENT_TIMESTAMP() AS recommendations_calculated_at
+
+FROM timing_intelligence
+ORDER BY creator_username, opportunity_score DESC, send_hour;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L2', 'heatmaps',
+  'SUCCESS',
+  'Created intelligent heatmap analysis with fan segmentation and predictive timing recommendations',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L2.02 COMPLETE' as status,
+  'Advanced heatmaps created with AI-powered timing optimization and fan segment analysis' as message,
+  CURRENT_TIMESTAMP() as completed_at;

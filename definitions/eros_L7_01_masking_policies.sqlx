@@ -1,0 +1,447 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L7", "masking_policies"],
+  dependencies: ["eros_L6_01_config"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L7.01: Data Masking Policies for Security & Privacy
+-- ================================================================
+-- Implements data masking and row-level security for sensitive data
+-- Protects PII, financial data, and creator information
+-- ================================================================
+
+-- Revenue masking policy - masks earnings data for unauthorized users
+CREATE OR REPLACE ROW ACCESS POLICY `of-scheduler-proj.layer_07_security.policy_revenue_access`
+ON `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+GRANT TO ("group:revenue_analysts@company.com", "group:executives@company.com", "group:admin@company.com")
+FILTER USING (
+  -- Allow access to revenue data only for authorized roles
+  SESSION_USER() IN (
+    'revenue-analyst@company.com',
+    'finance-manager@company.com',
+    'ceo@company.com',
+    'analytics-team@company.com'
+  )
+  OR
+  -- Allow creators to see their own revenue data
+  sender = (
+    SELECT creator_name
+    FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+    WHERE user_email = SESSION_USER()
+  )
+);
+
+-- PII masking policy for message content
+CREATE OR REPLACE ROW ACCESS POLICY `of-scheduler-proj.layer_07_security.policy_message_content_access`
+ON `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+GRANT TO ("group:content_moderators@company.com", "group:ml_engineers@company.com", "group:admin@company.com")
+FILTER USING (
+  -- Restrict full message content access
+  SESSION_USER() IN (
+    'content-moderator@company.com',
+    'ml-engineer@company.com',
+    'data-scientist@company.com',
+    'compliance-officer@company.com'
+  )
+  OR
+  -- Allow creators to see their own messages
+  sender = (
+    SELECT creator_name
+    FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+    WHERE user_email = SESSION_USER()
+  )
+  OR
+  -- Allow schedulers to see messages of assigned creators
+  sender IN (
+    SELECT creator_name
+    FROM `of-scheduler-proj.governance.scheduler_assignments` sa
+    JOIN `of-scheduler-proj.layer_07_security.user_creator_mapping` ucm
+      ON sa.scheduler_email = ucm.user_email
+    WHERE ucm.user_email = SESSION_USER()
+  )
+);
+
+-- Creator performance data access policy
+CREATE OR REPLACE ROW ACCESS POLICY `of-scheduler-proj.layer_07_security.policy_creator_performance_access`
+ON `of-scheduler-proj.layer_01_semantic.v_message_facts_by_page`
+GRANT TO ("group:schedulers@company.com", "group:managers@company.com", "group:analytics@company.com")
+FILTER USING (
+  -- Schedulers can only see their assigned creators
+  creator_name IN (
+    SELECT creator_name
+    FROM `of-scheduler-proj.governance.scheduler_assignments`
+    WHERE scheduler_email = SESSION_USER()
+  )
+  OR
+  -- Managers and analytics can see aggregate data
+  SESSION_USER() IN (
+    'manager@company.com',
+    'analytics-lead@company.com',
+    'operations-director@company.com'
+  )
+  OR
+  -- Creators can see their own performance
+  creator_name = (
+    SELECT creator_name
+    FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+    WHERE user_email = SESSION_USER()
+  )
+);
+
+-- User-creator mapping table for access control
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_07_security.user_creator_mapping` (
+  user_email STRING NOT NULL,
+  creator_name STRING NOT NULL,
+  access_level STRING NOT NULL,  -- OWNER, SCHEDULER, VIEWER, ADMIN
+  granted_by STRING,
+  granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  expires_at TIMESTAMP,
+  is_active BOOL DEFAULT true
+)
+CLUSTER BY (user_email, creator_name)
+;
+
+-- Initialize user-creator mappings (example data)
+INSERT INTO `of-scheduler-proj.layer_07_security.user_creator_mapping` (
+  user_email,
+  creator_name,
+  access_level,
+  granted_by
+)
+SELECT DISTINCT
+  'scheduler1@company.com' AS user_email,
+  creator_name,
+  'SCHEDULER' AS access_level,
+  'system_init' AS granted_by
+FROM `of-scheduler-proj.layer_01_semantic.v_message_facts_by_page`
+WHERE creator_name IS NOT NULL
+LIMIT 10  -- Example: assign first 10 creators to scheduler1
+;
+
+-- Data classification table
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_07_security.data_classification` (
+  table_name STRING NOT NULL,
+  column_name STRING NOT NULL,
+  classification_level STRING NOT NULL,  -- PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+  data_type STRING NOT NULL,  -- PII, FINANCIAL, PERFORMANCE, CONTENT, METADATA
+  masking_strategy STRING,  -- HASH, NULLIFY, PARTIAL_MASK, ENCRYPT, NO_MASK
+  retention_days INT64,
+  compliance_tags ARRAY<STRING>,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING DEFAULT SESSION_USER()
+)
+;
+
+-- Initialize data classification
+INSERT INTO `of-scheduler-proj.layer_07_security.data_classification` (
+  table_name,
+  column_name,
+  classification_level,
+  data_type,
+  masking_strategy,
+  retention_days,
+  compliance_tags
+) VALUES
+  -- Message content classification
+  ('mass_message_master', 'message', 'CONFIDENTIAL', 'CONTENT', 'PARTIAL_MASK', 2555, ['CONTENT_POLICY', 'PRIVACY']),
+  ('mass_message_master', 'message_id', 'INTERNAL', 'METADATA', 'NO_MASK', 2555, ['OPERATIONAL']),
+  ('mass_message_master', 'sender', 'CONFIDENTIAL', 'PII', 'HASH', 2555, ['CREATOR_PRIVACY']),
+
+  -- Financial data classification
+  ('mass_message_master', 'earnings', 'RESTRICTED', 'FINANCIAL', 'NULLIFY', 2555, ['FINANCIAL_DATA', 'SOX_COMPLIANCE']),
+  ('mass_message_master', 'price', 'CONFIDENTIAL', 'FINANCIAL', 'PARTIAL_MASK', 2555, ['PRICING_DATA']),
+
+  -- Performance metrics
+  ('mass_message_master', 'sent', 'INTERNAL', 'PERFORMANCE', 'NO_MASK', 1095, ['ANALYTICS']),
+  ('mass_message_master', 'viewed', 'INTERNAL', 'PERFORMANCE', 'NO_MASK', 1095, ['ANALYTICS']),
+  ('mass_message_master', 'purchased', 'CONFIDENTIAL', 'PERFORMANCE', 'NO_MASK', 1095, ['BUSINESS_METRICS']),
+
+  -- Timestamps and metadata
+  ('mass_message_master', 'sending_time', 'INTERNAL', 'METADATA', 'NO_MASK', 2555, ['OPERATIONAL']),
+  ('mass_message_master', 'loaded_at', 'INTERNAL', 'METADATA', 'NO_MASK', 365, ['OPERATIONAL']),
+
+  -- ML and analytics tables
+  ('next24_ml_recommendations_latest', 'creator_name', 'CONFIDENTIAL', 'PII', 'HASH', 90, ['ML_DATA']),
+  ('next24_ml_recommendations_latest', 'predicted_revenue', 'CONFIDENTIAL', 'FINANCIAL', 'PARTIAL_MASK', 90, ['ML_PREDICTIONS']),
+  ('alert_history', 'alert_description', 'INTERNAL', 'METADATA', 'NO_MASK', 365, ['MONITORING'])
+;
+
+-- Masking functions for different data types
+CREATE OR REPLACE FUNCTION `of-scheduler-proj.layer_07_security.mask_creator_name`(creator_name STRING)
+RETURNS STRING
+LANGUAGE SQL
+AS (
+  CASE
+    WHEN SESSION_USER() IN (
+      SELECT user_email
+      FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+      WHERE access_level IN ('ADMIN', 'SCHEDULER')
+    ) THEN creator_name
+    ELSE CONCAT('Creator_', TO_BASE64(SHA256(creator_name))[OFFSET(0):8])
+  END
+);
+
+CREATE OR REPLACE FUNCTION `of-scheduler-proj.layer_07_security.mask_revenue`(revenue FLOAT64)
+RETURNS FLOAT64
+LANGUAGE SQL
+AS (
+  CASE
+    WHEN SESSION_USER() IN (
+      'revenue-analyst@company.com',
+      'finance-manager@company.com',
+      'ceo@company.com'
+    ) THEN revenue
+    WHEN SESSION_USER() LIKE '%@company.com' THEN
+      -- Show revenue in ranges for internal users
+      CASE
+        WHEN revenue > 1000 THEN 1000.0
+        WHEN revenue > 500 THEN 500.0
+        WHEN revenue > 100 THEN 100.0
+        ELSE 0.0
+      END
+    ELSE NULL
+  END
+);
+
+CREATE OR REPLACE FUNCTION `of-scheduler-proj.layer_07_security.mask_message_content`(message STRING)
+RETURNS STRING
+LANGUAGE SQL
+AS (
+  CASE
+    WHEN SESSION_USER() IN (
+      'content-moderator@company.com',
+      'ml-engineer@company.com',
+      'compliance-officer@company.com'
+    ) THEN message
+    WHEN SESSION_USER() LIKE '%@company.com' THEN
+      -- Show truncated message for internal users
+      CASE
+        WHEN LENGTH(message) > 50 THEN CONCAT(SUBSTR(message, 1, 47), '...')
+        ELSE message
+      END
+    ELSE '[REDACTED]'
+  END
+);
+
+-- Secure views with masking applied
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_secure_message_summary` AS
+SELECT
+  message_id,
+  `of-scheduler-proj.layer_07_security.mask_creator_name`(sender) AS creator_name,
+  `of-scheduler-proj.layer_07_security.mask_message_content`(message) AS message_preview,
+  sending_time,
+  sent,
+  viewed,
+  purchased,
+  `of-scheduler-proj.layer_07_security.mask_revenue`(earnings) AS earnings,
+
+  -- Only show price to authorized users
+  CASE
+    WHEN SESSION_USER() IN (
+      SELECT user_email
+      FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+      WHERE access_level IN ('ADMIN', 'SCHEDULER')
+    ) THEN price
+    ELSE NULL
+  END AS price,
+
+  status,
+  source_file,
+  loaded_at
+
+FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+WHERE
+  -- Apply row-level security
+  (
+    -- Allow access to users with appropriate roles
+    SESSION_USER() IN (
+      'admin@company.com',
+      'operations-manager@company.com'
+    )
+    OR
+    -- Allow schedulers to see their assigned creators
+    sender IN (
+      SELECT creator_name
+      FROM `of-scheduler-proj.governance.scheduler_assignments`
+      WHERE scheduler_email = SESSION_USER()
+    )
+    OR
+    -- Allow creators to see their own data
+    sender = (
+      SELECT creator_name
+      FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+      WHERE user_email = SESSION_USER()
+    )
+  )
+;
+
+-- Secure creator performance view
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_secure_creator_performance` AS
+SELECT
+  `of-scheduler-proj.layer_07_security.mask_creator_name`(creator_name) AS creator_name,
+
+  -- Performance metrics with conditional access
+  CASE
+    WHEN SESSION_USER() IN (
+      SELECT user_email
+      FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+      WHERE access_level IN ('ADMIN', 'SCHEDULER', 'OWNER')
+    ) THEN avg_view_rate_7d
+    ELSE NULL
+  END AS avg_view_rate_7d,
+
+  CASE
+    WHEN SESSION_USER() IN (
+      SELECT user_email
+      FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+      WHERE access_level IN ('ADMIN', 'SCHEDULER', 'OWNER')
+    ) THEN avg_conversion_rate_7d
+    ELSE NULL
+  END AS avg_conversion_rate_7d,
+
+  -- Revenue with masking
+  `of-scheduler-proj.layer_07_security.mask_revenue`(total_revenue_7d) AS total_revenue_7d,
+
+  -- Non-sensitive metrics available to all
+  total_messages_7d,
+  last_message_time,
+  is_active,
+  creator_tier
+
+FROM `of-scheduler-proj.layer_01_semantic.v_message_facts_by_page`
+WHERE
+  -- Row-level security for creator performance
+  (
+    creator_name IN (
+      SELECT creator_name
+      FROM `of-scheduler-proj.governance.scheduler_assignments`
+      WHERE scheduler_email = SESSION_USER()
+    )
+    OR
+    creator_name = (
+      SELECT creator_name
+      FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+      WHERE user_email = SESSION_USER()
+    )
+    OR
+    SESSION_USER() IN (
+      'admin@company.com',
+      'operations-manager@company.com',
+      'analytics-lead@company.com'
+    )
+  )
+;
+
+-- Audit trail for data access
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_07_security.data_access_log` (
+  access_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  user_email STRING NOT NULL,
+  table_accessed STRING NOT NULL,
+  access_method STRING,  -- QUERY, EXPORT, API, DASHBOARD
+  query_text STRING,
+  rows_accessed INT64,
+  data_classification_level STRING,
+  session_id STRING,
+  ip_address STRING,
+  user_agent STRING
+)
+PARTITION BY DATE(access_timestamp)
+CLUSTER BY (user_email, table_accessed)
+;
+
+-- Data retention policy enforcement
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_07_security.sp_enforce_data_retention`()
+BEGIN
+  DECLARE retention_cursor CURSOR FOR
+    SELECT table_name, column_name, retention_days
+    FROM `of-scheduler-proj.layer_07_security.data_classification`
+    WHERE retention_days IS NOT NULL;
+
+  FOR record IN retention_cursor DO
+    -- Example: Delete old data based on retention policies
+    -- This would need to be customized per table structure
+    IF record.table_name = 'mass_message_master' THEN
+      DELETE FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+      WHERE DATE(sending_time) < DATE_SUB(CURRENT_DATE(), INTERVAL record.retention_days DAY);
+    END IF;
+
+    IF record.table_name = 'alert_history' THEN
+      DELETE FROM `of-scheduler-proj.layer_06_monitoring.alert_history`
+      WHERE DATE(detected_at) < DATE_SUB(CURRENT_DATE(), INTERVAL record.retention_days DAY);
+    END IF;
+  END FOR;
+
+  -- Log retention enforcement
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'DATA_RETENTION_ENFORCED',
+    'layer_07_security',
+    'Data retention policies enforced'
+  );
+END;
+
+-- Security compliance report
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_security_compliance_report` AS
+WITH data_inventory AS (
+  SELECT
+    table_name,
+    COUNT(*) AS total_columns,
+    COUNTIF(classification_level = 'RESTRICTED') AS restricted_columns,
+    COUNTIF(classification_level = 'CONFIDENTIAL') AS confidential_columns,
+    COUNTIF(data_type = 'PII') AS pii_columns,
+    COUNTIF(data_type = 'FINANCIAL') AS financial_columns,
+    STRING_AGG(DISTINCT compliance_tags[OFFSET(0)] ORDER BY compliance_tags[OFFSET(0)]) AS compliance_frameworks
+  FROM `of-scheduler-proj.layer_07_security.data_classification`,
+  UNNEST(compliance_tags) AS compliance_tag
+  GROUP BY table_name
+),
+
+access_summary AS (
+  SELECT
+    COUNT(DISTINCT user_email) AS total_users,
+    COUNT(*) AS total_mappings,
+    COUNTIF(access_level = 'ADMIN') AS admin_users,
+    COUNTIF(access_level = 'SCHEDULER') AS scheduler_users,
+    COUNTIF(is_active = false) AS inactive_mappings
+  FROM `of-scheduler-proj.layer_07_security.user_creator_mapping`
+)
+
+SELECT
+  CURRENT_TIMESTAMP() AS report_timestamp,
+
+  -- Data classification summary
+  (SELECT COUNT(DISTINCT table_name) FROM data_inventory) AS classified_tables,
+  (SELECT SUM(total_columns) FROM data_inventory) AS total_classified_columns,
+  (SELECT SUM(restricted_columns) FROM data_inventory) AS restricted_columns,
+  (SELECT SUM(confidential_columns) FROM data_inventory) AS confidential_columns,
+  (SELECT SUM(pii_columns) FROM data_inventory) AS pii_columns,
+  (SELECT SUM(financial_columns) FROM data_inventory) AS financial_columns,
+
+  -- Access control summary
+  (SELECT total_users FROM access_summary) AS total_authorized_users,
+  (SELECT admin_users FROM access_summary) AS admin_users,
+  (SELECT scheduler_users FROM access_summary) AS scheduler_users,
+  (SELECT inactive_mappings FROM access_summary) AS inactive_access_grants,
+
+  -- Compliance frameworks
+  (SELECT STRING_AGG(DISTINCT compliance_frameworks) FROM data_inventory) AS active_compliance_frameworks,
+
+  -- Security posture
+  CASE
+    WHEN (SELECT SUM(restricted_columns) FROM data_inventory) > 0
+         AND (SELECT admin_users FROM access_summary) <= 2
+    THEN '🟢 COMPLIANT'
+    WHEN (SELECT SUM(pii_columns) FROM data_inventory) > 0
+         AND (SELECT inactive_mappings FROM access_summary) = 0
+    THEN '🟡 NEEDS_REVIEW'
+    ELSE '🔴 NON_COMPLIANT'
+  END AS security_posture
+;

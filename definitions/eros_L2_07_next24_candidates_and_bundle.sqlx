@@ -1,0 +1,477 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L2", "next24_candidates_and_bundle"],
+  dependencies: ["eros_L1_01_reference_enums", "eros_L1_02_v_message_facts_by_page"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L2.07: Next-24 Candidates & Bundle - AI-Powered Decision Engine
+-- =====================================================================
+-- Intelligent candidate generation and bundle optimization for next 24-hour
+-- scheduling decisions with ML scoring and multi-objective optimization.
+-- =====================================================================
+
+-- =====================================================================
+-- NEXT-24 CANDIDATE GENERATION VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_02_features.v_next24_candidates` AS
+WITH timing_windows AS (
+  -- Generate optimal timing windows for next 24 hours
+  SELECT
+    creator_username,
+    creator_tier,
+
+    -- Generate 24 hourly slots
+    hour_slot,
+    DATETIME_ADD(DATETIME_TRUNC(CURRENT_DATETIME(), HOUR), INTERVAL hour_slot HOUR) AS candidate_datetime,
+    EXTRACT(HOUR FROM DATETIME_ADD(DATETIME_TRUNC(CURRENT_DATETIME(), HOUR), INTERVAL hour_slot HOUR)) AS candidate_hour,
+    EXTRACT(DAYOFWEEK FROM DATE_ADD(CURRENT_DATE(), INTERVAL hour_slot HOUR)) AS candidate_dayofweek,
+
+    -- Calculate hours since last send (simulated)
+    hour_slot + RAND() * 12 AS hours_since_last_send,
+
+    -- Creator context from latest data
+    cp.baseline_rpm,
+    cp.baseline_conversion_rate,
+    COALESCE(pd.recent_rpm_trend, 1.0) AS recent_trend,
+    pd.creator_tier AS current_tier
+
+  FROM (
+    SELECT GENERATE_ARRAY(0, 23) AS hour_slots
+  ), UNNEST(hour_slots) AS hour_slot
+  CROSS JOIN (
+    SELECT DISTINCT creator_username, creator_tier
+    FROM `layer_01_semantic.v_page_dim`
+    WHERE total_messages >= 5
+      AND days_since_last_activity <= 7
+  ) creators
+  LEFT JOIN `reference.creator_profiles` cp
+    ON creators.creator_username = cp.username_std
+  LEFT JOIN `layer_01_semantic.v_page_dim` pd
+    ON creators.creator_username = pd.creator_username
+),
+
+content_candidates AS (
+  -- Select candidate content for each timing window
+  SELECT
+    tw.creator_username,
+    tw.creator_tier,
+    tw.hour_slot,
+    tw.candidate_datetime,
+    tw.candidate_hour,
+    tw.candidate_dayofweek,
+    tw.hours_since_last_send,
+    tw.baseline_rpm,
+    tw.baseline_conversion_rate,
+    tw.recent_trend,
+
+    -- Select high-performing, non-fatigued content
+    cd.caption_hash,
+    cd.caption_text,
+    cd.content_category,
+    cd.avg_conversion_rate AS content_historical_conversion,
+    cd.avg_rpm AS content_historical_rpm,
+    cd.performance_tier,
+    cd.novelty_classification,
+
+    -- Content features for scoring
+    cd.char_length,
+    cd.emoji_count,
+    cd.has_price_placeholder,
+    cd.has_name_placeholder,
+    COALESCE(cd.avg_novelty_score, 0.5) AS content_novelty_score,
+
+    -- Usage context
+    cu.fatigue_level,
+    cu.days_since_last_use,
+    cu.recommended_action
+
+  FROM timing_windows tw
+  LEFT JOIN `layer_01_semantic.v_caption_dim` cd
+    ON cd.used_by_creators_count >= 1  -- Has been used before
+    AND cd.performance_tier IN ('HIGH_PERFORMER', 'GOOD_PERFORMER', 'ELITE')
+    AND cd.total_usage_count >= 3  -- Proven content
+  LEFT JOIN `layer_01_semantic.v_caption_usage` cu
+    ON cd.caption_hash = cu.caption_hash
+    AND tw.creator_username = cu.creator_username
+    AND cu.fatigue_level NOT IN ('HIGH_FATIGUE', 'MODERATE_FATIGUE')
+    AND cu.recommended_action NOT IN ('RETIRE_IMMEDIATELY', 'REST_REQUIRED')
+
+  WHERE cd.caption_hash IS NOT NULL
+),
+
+fan_context AS (
+  -- Add fan segmentation context for each candidate
+  SELECT
+    cc.*,
+
+    -- Estimated fan segment activity for this hour
+    CASE
+      WHEN cc.candidate_hour BETWEEN 22 AND 6 THEN 'NIGHT_OWLS'
+      WHEN cc.candidate_hour BETWEEN 10 AND 16 AND cc.candidate_dayofweek NOT IN (1, 7) THEN 'BROWSERS'
+      WHEN cc.content_historical_rpm >= 2.0 THEN 'WHALES'
+      WHEN cc.content_historical_conversion >= 0.05 THEN 'LOYALISTS'
+      ELSE 'TEASERS'
+    END AS primary_fan_segment,
+
+    -- Fan activity score (simulated based on timing patterns)
+    CASE
+      WHEN cc.candidate_hour IN (11, 12, 13, 19, 20, 21, 22) THEN 0.9
+      WHEN cc.candidate_hour IN (10, 14, 15, 16, 17, 18, 23) THEN 0.7
+      WHEN cc.candidate_hour IN (8, 9, 24, 1) THEN 0.5
+      ELSE 0.3
+    END AS fan_activity_score,
+
+    -- Price sensitivity (based on fan segment)
+    CASE
+      WHEN cc.candidate_hour BETWEEN 22 AND 6 THEN 0.3  -- Night owls less price sensitive
+      WHEN cc.candidate_hour BETWEEN 10 AND 16 THEN 0.7  -- Browsers more price sensitive
+      ELSE 0.5
+    END AS fan_price_sensitivity
+
+  FROM content_candidates cc
+),
+
+scoring_engine AS (
+  -- Apply advanced slot scoring to each candidate
+  SELECT
+    fc.*,
+
+    -- Extract price from content if available
+    `layer_02_features.extract_price`(fc.caption_text) AS estimated_price,
+
+    -- Calculate advanced slot score
+    `layer_02_features.calculate_slot_score_v2`(
+      fc.creator_tier,
+      fc.baseline_rpm,
+      fc.baseline_conversion_rate,
+      fc.recent_trend,
+      fc.content_category,
+      fc.content_novelty_score,
+      fc.char_length,
+      fc.has_price_placeholder,
+      fc.has_name_placeholder,
+      fc.content_historical_rpm,
+      fc.candidate_hour,
+      fc.candidate_dayofweek,
+      fc.hours_since_last_send,
+      fc.fan_activity_score,
+      fc.primary_fan_segment,
+      COALESCE(fc.content_historical_conversion, 0.05),
+      fc.fan_price_sensitivity,
+      0.5,  -- competitive_activity_score (placeholder)
+      1.0,  -- seasonal_boost_factor (placeholder)
+      0.8   -- platform_health_score (placeholder)
+    ) AS slot_score,
+
+    -- Multi-objective scoring
+    `layer_02_features.calculate_multi_objective_score`(
+      `layer_02_features.calculate_slot_score_v2`(
+        fc.creator_tier, fc.baseline_rpm, fc.baseline_conversion_rate, fc.recent_trend,
+        fc.content_category, fc.content_novelty_score, fc.char_length,
+        fc.has_price_placeholder, fc.has_name_placeholder, fc.content_historical_rpm,
+        fc.candidate_hour, fc.candidate_dayofweek, fc.hours_since_last_send,
+        fc.fan_activity_score, fc.primary_fan_segment,
+        COALESCE(fc.content_historical_conversion, 0.05), fc.fan_price_sensitivity,
+        0.5, 1.0, 0.8
+      ),
+      fc.content_historical_rpm / 2.0,  -- revenue_potential
+      fc.content_historical_conversion * 10,  -- engagement_potential
+      CASE WHEN fc.fatigue_level = 'NO_FATIGUE' THEN 0.1 ELSE 0.3 END,  -- risk_score
+      CASE WHEN fc.performance_tier = 'ELITE' THEN 0.9 ELSE 0.6 END,  -- strategic_value
+      JSON '{"revenue_weight": 0.4, "engagement_weight": 0.3, "consistency_weight": 0.2, "growth_weight": 0.08, "risk_weight": 0.02}'
+    ) AS multi_objective_score
+
+  FROM fan_context fc
+),
+
+candidate_ranking AS (
+  -- Rank and filter candidates
+  SELECT
+    se.*,
+
+    -- Rank within creator and time slot
+    ROW_NUMBER() OVER (
+      PARTITION BY se.creator_username, se.hour_slot
+      ORDER BY se.multi_objective_score DESC, se.slot_score DESC
+    ) AS content_rank_for_slot,
+
+    -- Global ranking for creator
+    ROW_NUMBER() OVER (
+      PARTITION BY se.creator_username
+      ORDER BY se.multi_objective_score DESC, se.slot_score DESC
+    ) AS global_content_rank,
+
+    -- Time slot ranking for creator
+    ROW_NUMBER() OVER (
+      PARTITION BY se.creator_username
+      ORDER BY se.candidate_hour, se.multi_objective_score DESC
+    ) AS time_slot_rank,
+
+    -- Expected performance metrics
+    se.content_historical_rpm * se.slot_score AS expected_rpm,
+    se.content_historical_conversion * se.slot_score AS expected_conversion,
+
+    -- Confidence scoring
+    CASE
+      WHEN se.performance_tier = 'ELITE' AND se.fatigue_level = 'NO_FATIGUE' THEN 0.9
+      WHEN se.performance_tier IN ('HIGH_PERFORMER', 'ELITE') THEN 0.8
+      WHEN se.performance_tier = 'GOOD_PERFORMER' THEN 0.7
+      ELSE 0.6
+    END * se.slot_score AS confidence_score
+
+  FROM scoring_engine se
+  WHERE se.slot_score >= 0.3  -- Minimum viability threshold
+)
+
+-- Main candidates view
+SELECT
+  creator_username,
+  creator_tier,
+  hour_slot,
+  candidate_datetime,
+  candidate_hour,
+  candidate_dayofweek,
+  ROUND(hours_since_last_send, 2) AS hours_since_last_send,
+
+  -- Content selection
+  caption_hash,
+  LEFT(caption_text, 100) AS caption_preview,
+  content_category,
+  performance_tier,
+  novelty_classification,
+
+  -- Scoring
+  ROUND(slot_score, 4) AS slot_score,
+  ROUND(multi_objective_score, 4) AS multi_objective_score,
+  ROUND(expected_rpm, 4) AS expected_rpm,
+  ROUND(expected_conversion, 4) AS expected_conversion,
+  ROUND(confidence_score, 4) AS confidence_score,
+
+  -- Rankings
+  content_rank_for_slot,
+  global_content_rank,
+  time_slot_rank,
+
+  -- Context
+  primary_fan_segment,
+  ROUND(fan_activity_score, 3) AS fan_activity_score,
+  fatigue_level,
+  days_since_last_use,
+  recommended_action,
+
+  -- Recommendations
+  CASE
+    WHEN multi_objective_score >= 0.8 AND confidence_score >= 0.8 THEN 'EXECUTE_IMMEDIATELY'
+    WHEN multi_objective_score >= 0.7 AND confidence_score >= 0.7 THEN 'HIGH_CONFIDENCE_EXECUTE'
+    WHEN multi_objective_score >= 0.6 AND confidence_score >= 0.6 THEN 'GOOD_CANDIDATE'
+    WHEN multi_objective_score >= 0.5 THEN 'MONITOR_AND_CONSIDER'
+    ELSE 'LOW_PRIORITY'
+  END AS execution_recommendation,
+
+  -- Feature importance for explainability
+  JSON_OBJECT(
+    'timing_score', ROUND(fan_activity_score, 3),
+    'content_quality', ROUND(content_historical_rpm / 2.0, 3),
+    'novelty_factor', ROUND(content_novelty_score, 3),
+    'fan_alignment', ROUND(fan_activity_score, 3),
+    'fatigue_impact', CASE WHEN fatigue_level = 'NO_FATIGUE' THEN 1.0 ELSE 0.7 END
+  ) AS feature_explanation,
+
+  CURRENT_TIMESTAMP() AS candidates_generated_at
+
+FROM candidate_ranking
+WHERE content_rank_for_slot <= 3  -- Top 3 content options per time slot
+ORDER BY creator_username, hour_slot, multi_objective_score DESC;
+
+-- =====================================================================
+-- NEXT-24 OPTIMIZED BUNDLE VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `layer_02_features.v_next24_optimized_bundle` AS
+WITH bundle_optimization AS (
+  -- Optimize content distribution across 24 hours
+  SELECT
+    creator_username,
+    creator_tier,
+
+    -- Time slot analysis
+    COUNT(DISTINCT hour_slot) AS available_time_slots,
+    COUNT(*) AS total_candidates,
+    AVG(multi_objective_score) AS avg_candidate_score,
+
+    -- Performance potential
+    SUM(expected_rpm) AS total_expected_rpm,
+    AVG(expected_rpm) AS avg_expected_rpm,
+    SUM(expected_conversion * 100) AS total_expected_conversions,
+
+    -- Diversity metrics
+    COUNT(DISTINCT content_category) AS content_type_diversity,
+    COUNT(DISTINCT primary_fan_segment) AS fan_segment_coverage,
+    COUNT(DISTINCT performance_tier) AS performance_tier_mix,
+
+    -- Risk assessment
+    AVG(confidence_score) AS avg_confidence,
+    COUNTIF(fatigue_level != 'NO_FATIGUE') AS content_fatigue_risk_count,
+    COUNTIF(execution_recommendation = 'LOW_PRIORITY') AS low_priority_count
+
+  FROM `layer_02_features.v_next24_candidates`
+  WHERE content_rank_for_slot = 1  -- Only top choice per slot
+  GROUP BY creator_username, creator_tier
+),
+
+bundle_strategy AS (
+  -- Determine optimal bundle strategy
+  SELECT
+    bo.*,
+
+    -- Strategy classification
+    CASE
+      WHEN avg_candidate_score >= 0.8 AND avg_confidence >= 0.8 THEN 'AGGRESSIVE_OPTIMIZATION'
+      WHEN avg_candidate_score >= 0.7 AND content_type_diversity >= 3 THEN 'BALANCED_APPROACH'
+      WHEN avg_candidate_score >= 0.6 THEN 'CONSERVATIVE_GROWTH'
+      WHEN low_priority_count / total_candidates > 0.5 THEN 'CONTENT_REFRESH_NEEDED'
+      ELSE 'MINIMAL_ACTIVITY'
+    END AS bundle_strategy,
+
+    -- Recommended send frequency
+    CASE
+      WHEN creator_tier = 'PREMIUM' AND avg_candidate_score >= 0.7 THEN
+        LEAST(8, GREATEST(3, ROUND(available_time_slots * 0.5)))
+      WHEN creator_tier = 'HIGH' AND avg_candidate_score >= 0.6 THEN
+        LEAST(6, GREATEST(2, ROUND(available_time_slots * 0.4)))
+      WHEN creator_tier = 'MED' AND avg_candidate_score >= 0.5 THEN
+        LEAST(5, GREATEST(2, ROUND(available_time_slots * 0.3)))
+      WHEN creator_tier = 'LOW' THEN
+        LEAST(4, GREATEST(1, ROUND(available_time_slots * 0.25)))
+      ELSE 3
+    END AS recommended_sends_24h,
+
+    -- Quality threshold
+    CASE
+      WHEN creator_tier IN ('PREMIUM', 'HIGH') THEN 0.6
+      WHEN creator_tier = 'MED' THEN 0.5
+      ELSE 0.4
+    END AS quality_threshold
+
+  FROM bundle_optimization bo
+),
+
+final_bundle AS (
+  -- Select final optimized bundle
+  SELECT
+    c.creator_username,
+    c.creator_tier,
+    bs.bundle_strategy,
+    bs.recommended_sends_24h,
+    bs.quality_threshold,
+
+    -- Selected candidates meeting criteria
+    ARRAY_AGG(
+      STRUCT(
+        c.hour_slot,
+        c.candidate_datetime,
+        c.caption_hash,
+        c.caption_preview,
+        c.content_category,
+        c.multi_objective_score,
+        c.expected_rpm,
+        c.confidence_score,
+        c.execution_recommendation,
+        c.primary_fan_segment
+      )
+      ORDER BY c.multi_objective_score DESC
+      LIMIT bs.recommended_sends_24h
+    ) AS selected_candidates,
+
+    -- Bundle performance projections
+    SUM(c.expected_rpm) AS projected_24h_rpm,
+    AVG(c.expected_conversion) AS projected_avg_conversion,
+    COUNT(*) AS final_send_count,
+    AVG(c.confidence_score) AS bundle_confidence,
+
+    -- Bundle diversity
+    COUNT(DISTINCT c.content_category) AS final_content_diversity,
+    COUNT(DISTINCT c.primary_fan_segment) AS final_segment_coverage,
+
+    -- Risk metrics
+    COUNTIF(c.fatigue_level != 'NO_FATIGUE') AS fatigue_risk_items,
+    COUNTIF(c.confidence_score < bs.quality_threshold) AS low_confidence_items
+
+  FROM `layer_02_features.v_next24_candidates` c
+  INNER JOIN bundle_strategy bs
+    ON c.creator_username = bs.creator_username
+  WHERE c.content_rank_for_slot = 1  -- Top choice per slot
+    AND c.multi_objective_score >= bs.quality_threshold
+    AND c.execution_recommendation NOT IN ('LOW_PRIORITY')
+  GROUP BY c.creator_username, c.creator_tier, bs.bundle_strategy,
+           bs.recommended_sends_24h, bs.quality_threshold
+)
+
+SELECT
+  creator_username,
+  creator_tier,
+  bundle_strategy,
+  recommended_sends_24h,
+  final_send_count,
+
+  -- Performance projections
+  ROUND(projected_24h_rpm, 2) AS projected_24h_revenue,
+  ROUND(projected_avg_conversion, 4) AS projected_avg_conversion,
+  ROUND(bundle_confidence, 3) AS bundle_confidence_score,
+
+  -- Bundle composition
+  selected_candidates,
+  final_content_diversity,
+  final_segment_coverage,
+
+  -- Quality metrics
+  ROUND(quality_threshold, 3) AS quality_threshold,
+  fatigue_risk_items,
+  low_confidence_items,
+
+  -- Strategic insights
+  CASE
+    WHEN bundle_strategy = 'AGGRESSIVE_OPTIMIZATION' THEN 'MAXIMIZE_HIGH_PERFORMING_OPPORTUNITIES'
+    WHEN bundle_strategy = 'BALANCED_APPROACH' THEN 'MAINTAIN_DIVERSITY_WITH_QUALITY'
+    WHEN bundle_strategy = 'CONSERVATIVE_GROWTH' THEN 'FOCUS_ON_PROVEN_STRATEGIES'
+    WHEN bundle_strategy = 'CONTENT_REFRESH_NEEDED' THEN 'URGENT_CONTENT_OPTIMIZATION_REQUIRED'
+    ELSE 'MINIMAL_STRATEGIC_ACTIVITY'
+  END AS strategic_guidance,
+
+  -- Success probability
+  CASE
+    WHEN bundle_confidence >= 0.8 AND fatigue_risk_items = 0 THEN 'HIGH_SUCCESS_PROBABILITY'
+    WHEN bundle_confidence >= 0.7 AND fatigue_risk_items <= 1 THEN 'GOOD_SUCCESS_PROBABILITY'
+    WHEN bundle_confidence >= 0.6 THEN 'MODERATE_SUCCESS_PROBABILITY'
+    ELSE 'LOW_SUCCESS_PROBABILITY'
+  END AS success_probability,
+
+  CURRENT_TIMESTAMP() AS bundle_optimized_at
+
+FROM final_bundle
+ORDER BY projected_24h_revenue DESC, bundle_confidence_score DESC;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L2', 'next24_candidates_and_bundle',
+  'SUCCESS',
+  'Created AI-powered next-24 candidate generation with bundle optimization and multi-objective scoring',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L2.07 COMPLETE' as status,
+  'Next-24 candidates and bundle optimization created with advanced AI scoring and strategic recommendations' as message,
+  CURRENT_TIMESTAMP() as completed_at;

@@ -1,0 +1,558 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L9", "retention_and_options"],
+  dependencies: ["eros_L8_01_backup_recovery"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L9.01: Data Lifecycle Management and Optimization
+-- ================================================================
+-- Data retention policies, archival, and performance optimization
+-- Manages data lifecycle from ingestion to deletion
+-- ================================================================
+
+-- Data lifecycle configuration table
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_09_lifecycle.data_lifecycle_policies` (
+  policy_id STRING NOT NULL,
+  policy_name STRING NOT NULL,
+  table_pattern STRING NOT NULL,  -- Pattern to match tables
+  policy_type STRING NOT NULL,    -- RETENTION, ARCHIVAL, PARTITIONING, CLUSTERING
+  policy_rules JSON NOT NULL,     -- Flexible rules configuration
+  is_active BOOL DEFAULT true,
+  policy_description STRING,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+  created_by STRING DEFAULT SESSION_USER(),
+  last_executed TIMESTAMP,
+  execution_count INT64 DEFAULT 0
+)
+CLUSTER BY (policy_type, is_active)
+;
+
+-- Initialize data lifecycle policies
+INSERT INTO `of-scheduler-proj.layer_09_lifecycle.data_lifecycle_policies` (
+  policy_id,
+  policy_name,
+  table_pattern,
+  policy_type,
+  policy_rules,
+  policy_description,
+  created_by
+) VALUES
+  -- Message data retention (keep 7 years for compliance)
+  ('RETENTION_001', 'Message Data Retention',
+   'of-scheduler-proj.layer_00_ingestion.mass_message_%',
+   'RETENTION',
+   JSON '{"retention_days": 2555, "archive_before_delete": true, "archive_location": "gs://eros-archive/messages/"}',
+   'Retain message data for 7 years, archive before deletion',
+   'system_init'),
+
+  -- ML predictions retention (short-term operational data)
+  ('RETENTION_002', 'ML Predictions Cleanup',
+   'layer_04_ml.%_predictions_%',
+   'RETENTION',
+   JSON '{"retention_days": 90, "archive_before_delete": false}',
+   'Clean up ML prediction tables after 90 days',
+   'system_init'),
+
+  -- Monitoring data retention
+  ('RETENTION_003', 'Monitoring Data Retention',
+   'layer_06_monitoring.%',
+   'RETENTION',
+   JSON '{"retention_days": 365, "archive_before_delete": true, "archive_location": "gs://eros-archive/monitoring/"}',
+   'Retain monitoring data for 1 year',
+   'system_init'),
+
+  -- Security audit log retention (7 years for compliance)
+  ('RETENTION_004', 'Security Audit Retention',
+   'layer_07_security.%_log',
+   'RETENTION',
+   JSON '{"retention_days": 2555, "archive_before_delete": true, "archive_location": "gs://eros-archive/security/"}',
+   'Retain security logs for 7 years',
+   'system_init'),
+
+  -- Partitioning policy for large tables
+  ('PARTITION_001', 'Time-based Partitioning',
+   'of-scheduler-proj.layer_00_ingestion.mass_message_master',
+   'PARTITIONING',
+   JSON '{"partition_field": "sending_time", "partition_type": "DAY", "require_partition_filter": true}',
+   'Enforce daily partitioning on message master table',
+   'system_init'),
+
+  -- Clustering optimization
+  ('CLUSTER_001', 'Message Master Clustering',
+   'of-scheduler-proj.layer_00_ingestion.mass_message_master',
+   'CLUSTERING',
+   JSON '{"cluster_fields": ["sender", "DATE(sending_time)"]}',
+   'Optimize clustering for common query patterns',
+   'system_init'),
+
+  -- Archival policy for old data
+  ('ARCHIVE_001', 'Cold Data Archival',
+   'layer_01_semantic.%',
+   'ARCHIVAL',
+   JSON '{"archive_after_days": 365, "archive_location": "gs://eros-coldline/semantic/", "storage_class": "COLDLINE"}',
+   'Archive semantic layer data to cold storage after 1 year',
+   'system_init')
+;
+
+-- Data lifecycle execution log
+CREATE OR REPLACE TABLE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log` (
+  execution_id STRING NOT NULL,
+  policy_id STRING NOT NULL,
+  execution_type STRING NOT NULL,  -- RETENTION, ARCHIVAL, OPTIMIZATION
+  affected_tables ARRAY<STRING>,
+  execution_start_time TIMESTAMP NOT NULL,
+  execution_end_time TIMESTAMP,
+  execution_status STRING DEFAULT 'RUNNING',
+  rows_processed INT64,
+  bytes_processed INT64,
+  error_message STRING,
+  execution_summary JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+)
+PARTITION BY DATE(execution_start_time)
+CLUSTER BY (policy_id, execution_status)
+;
+
+-- Data retention enforcement procedure
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_09_lifecycle.sp_enforce_data_retention`(
+  policy_id_param STRING DEFAULT NULL
+)
+BEGIN
+  DECLARE policy_cursor CURSOR FOR
+    SELECT policy_id, policy_name, table_pattern, policy_rules
+    FROM `of-scheduler-proj.layer_09_lifecycle.data_lifecycle_policies`
+    WHERE policy_type = 'RETENTION'
+      AND is_active = true
+      AND (policy_id_param IS NULL OR policy_id = policy_id_param);
+
+  DECLARE execution_id STRING DEFAULT GENERATE_UUID();
+  DECLARE affected_tables ARRAY<STRING> DEFAULT [];
+  DECLARE retention_days INT64;
+  DECLARE archive_before_delete BOOL;
+  DECLARE archive_location STRING;
+
+  FOR policy IN policy_cursor DO
+    SET execution_id = GENERATE_UUID();
+    SET affected_tables = [];
+
+    -- Parse policy rules
+    SET retention_days = CAST(JSON_EXTRACT_SCALAR(policy.policy_rules, '$.retention_days') AS INT64);
+    SET archive_before_delete = CAST(JSON_EXTRACT_SCALAR(policy.policy_rules, '$.archive_before_delete') AS BOOL);
+    SET archive_location = JSON_EXTRACT_SCALAR(policy.policy_rules, '$.archive_location');
+
+    -- Log execution start
+    INSERT INTO `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log` (
+      execution_id,
+      policy_id,
+      execution_type,
+      execution_start_time
+    ) VALUES (
+      execution_id,
+      policy.policy_id,
+      'RETENTION',
+      CURRENT_TIMESTAMP()
+    );
+
+    BEGIN
+      -- Process retention based on table pattern
+      IF policy.table_pattern = 'of-scheduler-proj.layer_00_ingestion.mass_message_%' THEN
+        -- Handle message data retention
+        IF archive_before_delete AND archive_location IS NOT NULL THEN
+          -- Archive old data first
+          EXPORT DATA
+          OPTIONS (
+            uri = CONCAT(archive_location, 'mass_message_master_', FORMAT_DATE('%Y%m%d', CURRENT_DATE()), '/*.parquet'),
+            format = 'PARQUET',
+            overwrite = false
+          )
+          AS (
+            SELECT *
+            FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+            WHERE DATE(sending_time) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY)
+          );
+        END IF;
+
+        -- Delete old data
+        DELETE FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+        WHERE DATE(sending_time) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY);
+
+        SET affected_tables = ['of-scheduler-proj.layer_00_ingestion.mass_message_master'];
+
+      ELSEIF policy.table_pattern LIKE 'layer_04_ml.%_predictions_%' THEN
+        -- Handle ML predictions cleanup
+        DELETE FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+        WHERE generated_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL retention_days DAY);
+
+        SET affected_tables = ['layer_04_ml.next24_ml_recommendations_latest'];
+
+      ELSEIF policy.table_pattern = 'layer_06_monitoring.%' THEN
+        -- Handle monitoring data retention
+        IF archive_before_delete AND archive_location IS NOT NULL THEN
+          -- Archive alert history
+          EXPORT DATA
+          OPTIONS (
+            uri = CONCAT(archive_location, 'alert_history_', FORMAT_DATE('%Y%m%d', CURRENT_DATE()), '/*.parquet'),
+            format = 'PARQUET',
+            overwrite = false
+          )
+          AS (
+            SELECT *
+            FROM `of-scheduler-proj.layer_06_monitoring.alert_history`
+            WHERE DATE(detected_at) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY)
+          );
+        END IF;
+
+        -- Delete old monitoring data
+        DELETE FROM `of-scheduler-proj.layer_06_monitoring.alert_history`
+        WHERE DATE(detected_at) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY);
+
+        DELETE FROM `of-scheduler-proj.layer_06_monitoring.system_events`
+        WHERE DATE(event_timestamp) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY);
+
+        SET affected_tables = ['layer_06_monitoring.alert_history', 'layer_06_monitoring.system_events'];
+
+      ELSEIF policy.table_pattern LIKE 'layer_07_security.%_log' THEN
+        -- Handle security log retention
+        IF archive_before_delete AND archive_location IS NOT NULL THEN
+          EXPORT DATA
+          OPTIONS (
+            uri = CONCAT(archive_location, 'data_access_log_', FORMAT_DATE('%Y%m%d', CURRENT_DATE()), '/*.parquet'),
+            format = 'PARQUET',
+            overwrite = false
+          )
+          AS (
+            SELECT *
+            FROM `of-scheduler-proj.layer_07_security.data_access_log`
+            WHERE DATE(access_timestamp) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY)
+          );
+        END IF;
+
+        -- Delete old security logs
+        DELETE FROM `of-scheduler-proj.layer_07_security.data_access_log`
+        WHERE DATE(access_timestamp) < DATE_SUB(CURRENT_DATE(), INTERVAL retention_days DAY);
+
+        SET affected_tables = ['layer_07_security.data_access_log'];
+      END IF;
+
+      -- Update execution success
+      UPDATE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+      SET
+        execution_end_time = CURRENT_TIMESTAMP(),
+        execution_status = 'SUCCESS',
+        affected_tables = affected_tables,
+        execution_summary = TO_JSON_STRING(STRUCT(
+          retention_days,
+          archive_before_delete,
+          archive_location
+        ))
+      WHERE execution_id = execution_id;
+
+      -- Update policy execution count
+      UPDATE `of-scheduler-proj.layer_09_lifecycle.data_lifecycle_policies`
+      SET
+        last_executed = CURRENT_TIMESTAMP(),
+        execution_count = execution_count + 1
+      WHERE policy_id = policy.policy_id;
+
+    EXCEPTION WHEN ERROR THEN
+      -- Log execution failure
+      UPDATE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+      SET
+        execution_end_time = CURRENT_TIMESTAMP(),
+        execution_status = 'FAILED',
+        error_message = @@error.message
+      WHERE execution_id = execution_id;
+
+      -- Continue with next policy (don't fail entire batch)
+      SELECT CONCAT('Retention policy failed: ', policy.policy_id, ' - ', @@error.message) AS warning;
+    END;
+  END FOR;
+
+  -- Log overall completion
+  INSERT INTO `of-scheduler-proj.layer_06_monitoring.system_events` (
+    event_timestamp,
+    event_type,
+    event_source,
+    event_description
+  ) VALUES (
+    CURRENT_TIMESTAMP(),
+    'DATA_RETENTION_ENFORCED',
+    'layer_09_lifecycle',
+    'Data retention policies enforced'
+  );
+END;
+
+-- Performance optimization procedure
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_09_lifecycle.sp_optimize_table_performance`(
+  target_table STRING
+)
+BEGIN
+  DECLARE optimization_id STRING DEFAULT GENERATE_UUID();
+  DECLARE table_info STRUCT<
+    table_type STRING,
+    partition_field STRING,
+    cluster_fields ARRAY<STRING>
+  >;
+
+  -- Log optimization start
+  INSERT INTO `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log` (
+    execution_id,
+    policy_id,
+    execution_type,
+    affected_tables,
+    execution_start_time
+  ) VALUES (
+    optimization_id,
+    'OPTIMIZE_MANUAL',
+    'OPTIMIZATION',
+    [target_table],
+    CURRENT_TIMESTAMP()
+  );
+
+  BEGIN
+    -- Get table information
+    SET table_info = (
+      SELECT AS STRUCT
+        table_type,
+        ddl
+      FROM `of-scheduler-proj.INFORMATION_SCHEMA.TABLES`
+      WHERE CONCAT(table_catalog, '.', table_schema, '.', table_name) = target_table
+    );
+
+    -- Apply optimizations based on table pattern
+    IF target_table LIKE '%mass_message%' THEN
+      -- Optimize message tables
+      EXECUTE IMMEDIATE CONCAT(
+        'ALTER TABLE `', target_table, '` ',
+        'SET OPTIONS (description = "Optimized for message queries - ',
+        FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP()), '")'
+      );
+
+      -- Note: Actual clustering/partitioning changes would require recreation
+      -- This is a placeholder for optimization logic
+
+    ELSEIF target_table LIKE '%ml_%' THEN
+      -- Optimize ML tables
+      EXECUTE IMMEDIATE CONCAT(
+        'ALTER TABLE `', target_table, '` ',
+        'SET OPTIONS (description = "Optimized for ML queries - ',
+        FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', CURRENT_TIMESTAMP()), '")'
+      );
+
+    END IF;
+
+    -- Update execution success
+    UPDATE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+    SET
+      execution_end_time = CURRENT_TIMESTAMP(),
+      execution_status = 'SUCCESS',
+      execution_summary = TO_JSON_STRING(STRUCT(
+        'PERFORMANCE_OPTIMIZATION' AS optimization_type,
+        target_table AS table_optimized
+      ))
+    WHERE execution_id = optimization_id;
+
+  EXCEPTION WHEN ERROR THEN
+    -- Log optimization failure
+    UPDATE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+    SET
+      execution_end_time = CURRENT_TIMESTAMP(),
+      execution_status = 'FAILED',
+      error_message = @@error.message
+    WHERE execution_id = optimization_id;
+
+    RAISE USING MESSAGE = CONCAT('Table optimization failed: ', @@error.message);
+  END;
+END;
+
+-- Data archival procedure
+CREATE OR REPLACE PROCEDURE `of-scheduler-proj.layer_09_lifecycle.sp_archive_cold_data`()
+BEGIN
+  DECLARE archival_cursor CURSOR FOR
+    SELECT policy_id, policy_name, table_pattern, policy_rules
+    FROM `of-scheduler-proj.layer_09_lifecycle.data_lifecycle_policies`
+    WHERE policy_type = 'ARCHIVAL'
+      AND is_active = true;
+
+  DECLARE execution_id STRING DEFAULT GENERATE_UUID();
+  DECLARE archive_after_days INT64;
+  DECLARE archive_location STRING;
+  DECLARE storage_class STRING;
+
+  FOR policy IN archival_cursor DO
+    SET execution_id = GENERATE_UUID();
+
+    -- Parse archival rules
+    SET archive_after_days = CAST(JSON_EXTRACT_SCALAR(policy.policy_rules, '$.archive_after_days') AS INT64);
+    SET archive_location = JSON_EXTRACT_SCALAR(policy.policy_rules, '$.archive_location');
+    SET storage_class = JSON_EXTRACT_SCALAR(policy.policy_rules, '$.storage_class');
+
+    -- Log archival start
+    INSERT INTO `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log` (
+      execution_id,
+      policy_id,
+      execution_type,
+      execution_start_time
+    ) VALUES (
+      execution_id,
+      policy.policy_id,
+      'ARCHIVAL',
+      CURRENT_TIMESTAMP()
+    );
+
+    BEGIN
+      -- Process archival based on table pattern
+      IF policy.table_pattern = 'layer_01_semantic.%' THEN
+        -- Archive semantic layer data
+        EXPORT DATA
+        OPTIONS (
+          uri = CONCAT(archive_location, 'message_facts_by_page_', FORMAT_DATE('%Y%m%d', CURRENT_DATE()), '/*.parquet'),
+          format = 'PARQUET',
+          overwrite = false
+        )
+        AS (
+          SELECT *
+          FROM `of-scheduler-proj.layer_01_semantic.v_message_facts_by_page`
+          WHERE DATE(last_message_time) < DATE_SUB(CURRENT_DATE(), INTERVAL archive_after_days DAY)
+        );
+      END IF;
+
+      -- Update execution success
+      UPDATE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+      SET
+        execution_end_time = CURRENT_TIMESTAMP(),
+        execution_status = 'SUCCESS',
+        execution_summary = TO_JSON_STRING(STRUCT(
+          archive_after_days,
+          archive_location,
+          storage_class
+        ))
+      WHERE execution_id = execution_id;
+
+    EXCEPTION WHEN ERROR THEN
+      -- Log archival failure
+      UPDATE `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+      SET
+        execution_end_time = CURRENT_TIMESTAMP(),
+        execution_status = 'FAILED',
+        error_message = @@error.message
+      WHERE execution_id = execution_id;
+    END;
+  END FOR;
+END;
+
+-- Lifecycle management dashboard
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_09_lifecycle.v_lifecycle_management_dashboard` AS
+WITH policy_summary AS (
+  SELECT
+    p.policy_id,
+    p.policy_name,
+    p.policy_type,
+    p.table_pattern,
+    p.is_active,
+    p.last_executed,
+    p.execution_count,
+
+    -- Extract key policy parameters
+    CASE p.policy_type
+      WHEN 'RETENTION' THEN CAST(JSON_EXTRACT_SCALAR(p.policy_rules, '$.retention_days') AS INT64)
+      WHEN 'ARCHIVAL' THEN CAST(JSON_EXTRACT_SCALAR(p.policy_rules, '$.archive_after_days') AS INT64)
+      ELSE NULL
+    END AS retention_archive_days,
+
+    -- Recent execution status
+    l.execution_status AS last_execution_status,
+    l.execution_end_time AS last_execution_time,
+    l.rows_processed AS last_rows_processed,
+    l.error_message AS last_error_message
+
+  FROM `of-scheduler-proj.layer_09_lifecycle.data_lifecycle_policies` p
+  LEFT JOIN (
+    SELECT DISTINCT
+      policy_id,
+      FIRST_VALUE(execution_status) OVER (PARTITION BY policy_id ORDER BY execution_start_time DESC) AS execution_status,
+      FIRST_VALUE(execution_end_time) OVER (PARTITION BY policy_id ORDER BY execution_start_time DESC) AS execution_end_time,
+      FIRST_VALUE(rows_processed) OVER (PARTITION BY policy_id ORDER BY execution_start_time DESC) AS rows_processed,
+      FIRST_VALUE(error_message) OVER (PARTITION BY policy_id ORDER BY execution_start_time DESC) AS error_message
+    FROM `of-scheduler-proj.layer_09_lifecycle.lifecycle_execution_log`
+    WHERE execution_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  ) l ON p.policy_id = l.policy_id
+),
+
+execution_stats AS (
+  SELECT
+    policy_type,
+    COUNT(*) AS total_policies,
+    COUNTIF(is_active) AS active_policies,
+    COUNTIF(last_executed IS NOT NULL) AS executed_policies,
+    COUNTIF(last_execution_status = 'SUCCESS') AS successful_executions,
+    COUNTIF(last_execution_status = 'FAILED') AS failed_executions,
+    MAX(last_executed) AS most_recent_execution
+
+  FROM policy_summary
+  GROUP BY policy_type
+)
+
+SELECT
+  CURRENT_TIMESTAMP() AS dashboard_timestamp,
+
+  -- Policy overview
+  (SELECT total_policies FROM execution_stats WHERE policy_type = 'RETENTION') AS retention_policies,
+  (SELECT total_policies FROM execution_stats WHERE policy_type = 'ARCHIVAL') AS archival_policies,
+  (SELECT total_policies FROM execution_stats WHERE policy_type = 'PARTITIONING') AS partitioning_policies,
+  (SELECT total_policies FROM execution_stats WHERE policy_type = 'CLUSTERING') AS clustering_policies,
+
+  -- Active policies
+  (SELECT active_policies FROM execution_stats WHERE policy_type = 'RETENTION') AS active_retention_policies,
+  (SELECT active_policies FROM execution_stats WHERE policy_type = 'ARCHIVAL') AS active_archival_policies,
+
+  -- Recent execution summary
+  (SELECT successful_executions FROM execution_stats WHERE policy_type = 'RETENTION') AS retention_successes,
+  (SELECT failed_executions FROM execution_stats WHERE policy_type = 'RETENTION') AS retention_failures,
+  (SELECT successful_executions FROM execution_stats WHERE policy_type = 'ARCHIVAL') AS archival_successes,
+  (SELECT failed_executions FROM execution_stats WHERE policy_type = 'ARCHIVAL') AS archival_failures,
+
+  -- Policy details
+  ARRAY(
+    SELECT AS STRUCT
+      policy_id,
+      policy_name,
+      policy_type,
+      table_pattern,
+      is_active,
+      retention_archive_days,
+      last_executed,
+      last_execution_status,
+      execution_count,
+      CASE
+        WHEN NOT is_active THEN '⏸️ DISABLED'
+        WHEN last_execution_status = 'FAILED' THEN '❌ FAILED'
+        WHEN last_executed IS NULL THEN '⚠️ NEVER_RUN'
+        WHEN last_execution_status = 'SUCCESS' THEN '✅ SUCCESS'
+        ELSE '❓ UNKNOWN'
+      END AS status_display
+    FROM policy_summary
+    ORDER BY policy_type, policy_name
+  ) AS policy_details,
+
+  -- System health
+  CASE
+    WHEN (SELECT SUM(failed_executions) FROM execution_stats) > 0 THEN '🔴 FAILURES_DETECTED'
+    WHEN (SELECT SUM(active_policies) FROM execution_stats) != (SELECT SUM(total_policies) FROM execution_stats) THEN '🟡 POLICIES_DISABLED'
+    ELSE '🟢 HEALTHY'
+  END AS lifecycle_health,
+
+  -- Recommendations
+  CASE
+    WHEN (SELECT failed_executions FROM execution_stats WHERE policy_type = 'RETENTION') > 0
+    THEN 'Review retention policy failures and resolve issues'
+    WHEN (SELECT active_retention_policies FROM execution_stats WHERE policy_type = 'RETENTION') = 0
+    THEN 'No active retention policies - data may grow indefinitely'
+    WHEN (SELECT most_recent_execution FROM execution_stats WHERE policy_type = 'RETENTION') < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+    THEN 'Retention policies have not run recently - check scheduling'
+    ELSE 'Lifecycle management operating normally'
+  END AS recommended_action
+;

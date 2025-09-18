@@ -1,0 +1,472 @@
+config {
+  type: "view",
+  tags: ["L1", "v_creator_weekly"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.03: Creator Weekly Performance - Intelligence & Trends
+-- =====================================================================
+-- Weekly aggregated creator performance with trend analysis, forecasting,
+-- and strategic insights for optimal scheduling decisions.
+-- =====================================================================
+
+-- =====================================================================
+-- MAIN WEEKLY PERFORMANCE VIEW
+-- =====================================================================
+
+
+WITH weekly_base AS (
+  -- Core weekly aggregations from message facts
+  SELECT
+    creator_username,
+    creator_tier,
+    DATE_TRUNC(send_date, WEEK(MONDAY)) AS week_start_date,
+
+    -- Volume metrics
+    COUNT(*) AS weekly_message_count,
+    COUNT(DISTINCT send_date) AS active_days_in_week,
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+    COUNT(DISTINCT content_category) AS content_types_used,
+
+    -- Engagement metrics
+    SUM(sent) AS total_sent,
+    SUM(viewed) AS total_viewed,
+    SUM(purchased) AS total_purchased,
+    SUM(earnings) AS total_earnings,
+
+    -- Performance metrics
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement_score,
+
+    -- Content quality metrics
+    AVG(novelty_score) AS avg_novelty,
+    AVG(data_quality_score) AS avg_quality_score,
+    AVG(char_length) AS avg_message_length,
+    AVG(emoji_count) AS avg_emoji_count,
+
+    -- Performance distribution
+    COUNTIF(performance_classification = 'HIGH_PERFORMER') AS high_performance_messages,
+    COUNTIF(performance_classification = 'POOR_PERFORMER') AS poor_performance_messages,
+
+    -- Timing patterns
+    APPROX_TOP_COUNT(send_hour, 1)[OFFSET(0)].value AS most_frequent_hour,
+    APPROX_TOP_COUNT(day_category, 1)[OFFSET(0)].value AS preferred_day_category,
+
+    -- Content patterns
+    APPROX_TOP_COUNT(content_category, 1)[OFFSET(0)].value AS primary_content_type,
+    COUNTIF(has_price_placeholder) AS price_messages,
+
+    -- Creator context
+    MAX(baseline_conversion_rate) AS baseline_conversion_rate,
+    MAX(baseline_rpm) AS baseline_rpm,
+    MAX(estimated_fan_count) AS estimated_fan_count,
+    MAX(tier_priority) AS tier_priority
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 26 WEEK)  -- 6 months
+  GROUP BY creator_username, creator_tier, week_start_date
+),
+
+weekly_trends AS (
+  -- Calculate week-over-week trends and patterns
+  SELECT
+    *,
+
+    -- Week-over-week growth rates
+    COALESCE(
+      (total_earnings - LAG(total_earnings) OVER (
+        PARTITION BY creator_username
+        ORDER BY week_start_date
+      )) / NULLIF(LAG(total_earnings) OVER (
+        PARTITION BY creator_username
+        ORDER BY week_start_date
+      ), 0),
+      0
+    ) AS earnings_growth_rate,
+
+    COALESCE(
+      (avg_rpm - LAG(avg_rpm) OVER (
+        PARTITION BY creator_username
+        ORDER BY week_start_date
+      )) / NULLIF(LAG(avg_rpm) OVER (
+        PARTITION BY creator_username
+        ORDER BY week_start_date
+      ), 0),
+      0
+    ) AS rpm_growth_rate,
+
+    COALESCE(
+      (avg_conversion_rate - LAG(avg_conversion_rate) OVER (
+        PARTITION BY creator_username
+        ORDER BY week_start_date
+      )) / NULLIF(LAG(avg_conversion_rate) OVER (
+        PARTITION BY creator_username
+        ORDER BY week_start_date
+      ), 0),
+      0
+    ) AS conversion_growth_rate,
+
+    -- Rolling averages for trend smoothing
+    AVG(total_earnings) OVER (
+      PARTITION BY creator_username
+      ORDER BY week_start_date
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS earnings_4week_avg,
+
+    AVG(avg_rpm) OVER (
+      PARTITION BY creator_username
+      ORDER BY week_start_date
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS rpm_4week_avg,
+
+    AVG(avg_conversion_rate) OVER (
+      PARTITION BY creator_username
+      ORDER BY week_start_date
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS conversion_4week_avg,
+
+    -- Performance consistency (standard deviation over 4 weeks)
+    STDDEV(total_earnings) OVER (
+      PARTITION BY creator_username
+      ORDER BY week_start_date
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS earnings_volatility,
+
+    STDDEV(avg_rpm) OVER (
+      PARTITION BY creator_username
+      ORDER BY week_start_date
+      ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    ) AS rpm_volatility,
+
+    -- Relative performance vs baseline
+    total_earnings / NULLIF(baseline_rpm * weekly_message_count, 0) AS earnings_vs_baseline,
+    avg_conversion_rate / NULLIF(baseline_conversion_rate, 0) AS conversion_vs_baseline
+
+  FROM weekly_base
+),
+
+seasonal_patterns AS (
+  -- Identify seasonal patterns and anomalies
+  SELECT
+    *,
+
+    -- Week-of-year patterns
+    EXTRACT(WEEK FROM week_start_date) AS week_of_year,
+    EXTRACT(MONTH FROM week_start_date) AS month_of_year,
+
+    -- Year-over-year comparison (if data available)
+    LAG(total_earnings, 52) OVER (
+      PARTITION BY creator_username
+      ORDER BY week_start_date
+    ) AS earnings_same_week_last_year,
+
+    -- Performance percentiles within creator's history
+    PERCENT_RANK() OVER (
+      PARTITION BY creator_username
+      ORDER BY total_earnings
+    ) AS earnings_percentile_rank,
+
+    PERCENT_RANK() OVER (
+      PARTITION BY creator_username
+      ORDER BY avg_rpm
+    ) AS rpm_percentile_rank,
+
+    -- Detect outlier weeks
+    CASE
+      WHEN ABS(total_earnings - earnings_4week_avg) > 2 * COALESCE(earnings_volatility, 0) THEN TRUE
+      ELSE FALSE
+    END AS is_earnings_outlier,
+
+    CASE
+      WHEN ABS(avg_rpm - rpm_4week_avg) > 2 * COALESCE(rpm_volatility, 0) THEN TRUE
+      ELSE FALSE
+    END AS is_rpm_outlier
+
+  FROM weekly_trends
+),
+
+performance_classification AS (
+  -- Classify weekly performance and generate insights
+  SELECT
+    *,
+
+    -- Performance tier for the week
+    CASE
+      WHEN earnings_percentile_rank >= 0.8 THEN 'EXCEPTIONAL'
+      WHEN earnings_percentile_rank >= 0.6 THEN 'STRONG'
+      WHEN earnings_percentile_rank >= 0.4 THEN 'AVERAGE'
+      WHEN earnings_percentile_rank >= 0.2 THEN 'BELOW_AVERAGE'
+      ELSE 'POOR'
+    END AS weekly_performance_tier,
+
+    -- Trend classification
+    CASE
+      WHEN earnings_growth_rate >= 0.2 THEN 'STRONG_GROWTH'
+      WHEN earnings_growth_rate >= 0.1 THEN 'MODERATE_GROWTH'
+      WHEN earnings_growth_rate >= -0.1 THEN 'STABLE'
+      WHEN earnings_growth_rate >= -0.2 THEN 'MODERATE_DECLINE'
+      ELSE 'STRONG_DECLINE'
+    END AS earnings_trend,
+
+    -- Consistency rating
+    CASE
+      WHEN COALESCE(earnings_volatility, 0) / NULLIF(earnings_4week_avg, 0) <= 0.2 THEN 'VERY_CONSISTENT'
+      WHEN COALESCE(earnings_volatility, 0) / NULLIF(earnings_4week_avg, 0) <= 0.4 THEN 'CONSISTENT'
+      WHEN COALESCE(earnings_volatility, 0) / NULLIF(earnings_4week_avg, 0) <= 0.6 THEN 'MODERATE'
+      WHEN COALESCE(earnings_volatility, 0) / NULLIF(earnings_4week_avg, 0) <= 0.8 THEN 'INCONSISTENT'
+      ELSE 'HIGHLY_VOLATILE'
+    END AS consistency_rating,
+
+    -- Strategic insights
+    CASE
+      WHEN avg_novelty < 0.3 AND poor_performance_messages > high_performance_messages THEN 'NEEDS_CONTENT_REFRESH'
+      WHEN hour_diversity <= 3 AND earnings_growth_rate < 0 THEN 'EXPAND_TIMING_STRATEGY'
+      WHEN content_types_used <= 2 AND weekly_performance_tier IN ('BELOW_AVERAGE', 'POOR') THEN 'DIVERSIFY_CONTENT'
+      WHEN earnings_vs_baseline < 0.7 THEN 'UNDERPERFORMING_BASELINE'
+      WHEN earnings_vs_baseline > 1.3 AND earnings_growth_rate > 0.1 THEN 'SCALE_SUCCESS_STRATEGY'
+      WHEN is_earnings_outlier AND earnings_percentile_rank >= 0.8 THEN 'ANALYZE_SUCCESS_FACTORS'
+      ELSE 'MAINTAIN_CURRENT_STRATEGY'
+    END AS strategic_recommendation,
+
+    -- Risk flags
+    ARRAY_CONCAT(
+      CASE WHEN earnings_growth_rate < -0.3 THEN ['REVENUE_DECLINE'] ELSE [] END,
+      CASE WHEN avg_novelty < 0.2 THEN ['CONTENT_STALENESS'] ELSE [] END,
+      CASE WHEN active_days_in_week <= 3 THEN ['LOW_ACTIVITY'] ELSE [] END,
+      CASE WHEN poor_performance_messages / weekly_message_count > 0.6 THEN ['HIGH_FAILURE_RATE'] ELSE [] END,
+      CASE WHEN conversion_vs_baseline < 0.5 THEN ['CONVERSION_CRISIS'] ELSE [] END
+    ) AS risk_flags
+
+  FROM seasonal_patterns
+)
+
+-- Main query with final calculations
+SELECT
+  creator_username,
+  creator_tier,
+  week_start_date,
+  DATE_ADD(week_start_date, INTERVAL 6 DAY) AS week_end_date,
+
+  -- Activity metrics
+  weekly_message_count,
+  active_days_in_week,
+  ROUND(weekly_message_count / GREATEST(active_days_in_week, 1), 2) AS avg_messages_per_active_day,
+
+  -- Volume metrics
+  total_sent,
+  total_viewed,
+  total_purchased,
+  total_earnings,
+
+  -- Performance metrics
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+  ROUND(avg_engagement_score, 4) AS avg_engagement_score,
+
+  -- Quality metrics
+  ROUND(avg_novelty, 3) AS avg_novelty,
+  ROUND(avg_quality_score, 3) AS avg_quality_score,
+  ROUND(avg_message_length, 1) AS avg_message_length,
+  ROUND(avg_emoji_count, 1) AS avg_emoji_count,
+
+  -- Performance distribution
+  high_performance_messages,
+  poor_performance_messages,
+  ROUND(high_performance_messages / weekly_message_count * 100, 1) AS high_performance_rate_pct,
+
+  -- Patterns
+  hour_diversity,
+  content_types_used,
+  most_frequent_hour,
+  preferred_day_category,
+  primary_content_type,
+  price_messages,
+
+  -- Baseline comparisons
+  ROUND(earnings_vs_baseline, 3) AS earnings_vs_baseline,
+  ROUND(conversion_vs_baseline, 3) AS conversion_vs_baseline,
+
+  -- Trends
+  ROUND(earnings_growth_rate, 4) AS earnings_growth_rate,
+  ROUND(rpm_growth_rate, 4) AS rpm_growth_rate,
+  ROUND(conversion_growth_rate, 4) AS conversion_growth_rate,
+  earnings_trend,
+
+  -- Rolling averages
+  ROUND(earnings_4week_avg, 2) AS earnings_4week_avg,
+  ROUND(rpm_4week_avg, 4) AS rpm_4week_avg,
+  ROUND(conversion_4week_avg, 4) AS conversion_4week_avg,
+
+  -- Volatility and consistency
+  ROUND(earnings_volatility, 2) AS earnings_volatility,
+  ROUND(rpm_volatility, 4) AS rpm_volatility,
+  consistency_rating,
+
+  -- Performance classification
+  weekly_performance_tier,
+  ROUND(earnings_percentile_rank, 3) AS earnings_percentile_rank,
+  ROUND(rpm_percentile_rank, 3) AS rpm_percentile_rank,
+
+  -- Anomaly detection
+  is_earnings_outlier,
+  is_rpm_outlier,
+
+  -- Seasonal context
+  week_of_year,
+  month_of_year,
+  earnings_same_week_last_year,
+
+  -- Strategic insights
+  strategic_recommendation,
+  risk_flags,
+
+  -- Creator context
+  estimated_fan_count,
+  tier_priority,
+
+  -- Calculated metrics
+  ROUND(total_earnings / GREATEST(estimated_fan_count, 1), 4) AS earnings_per_fan,
+  ROUND(total_earnings / GREATEST(weekly_message_count, 1), 4) AS earnings_per_message,
+
+  -- Metadata
+  CURRENT_TIMESTAMP() AS weekly_calculated_at
+
+FROM performance_classification
+ORDER BY creator_username, week_start_date DESC
+
+-- =====================================================================
+-- WEEKLY TRENDS SUMMARY VIEW
+-- =====================================================================
+
+
+WITH latest_weeks AS (
+  SELECT *
+  FROM `layer_01_semantic.v_creator_weekly`
+  WHERE week_start_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 12 WEEK)
+),
+
+trend_analysis AS (
+  SELECT
+    creator_username,
+    creator_tier,
+
+    -- Recent performance (last 4 weeks)
+    AVG(CASE WHEN week_start_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 4 WEEK)
+        THEN total_earnings END) AS recent_avg_earnings,
+    AVG(CASE WHEN week_start_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 4 WEEK)
+        THEN avg_rpm END) AS recent_avg_rpm,
+
+    -- Previous performance (weeks 5-8)
+    AVG(CASE WHEN week_start_date BETWEEN
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 8 WEEK) AND
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 5 WEEK)
+        THEN total_earnings END) AS previous_avg_earnings,
+    AVG(CASE WHEN week_start_date BETWEEN
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 8 WEEK) AND
+        DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(MONDAY)), INTERVAL 5 WEEK)
+        THEN avg_rpm END) AS previous_avg_rpm,
+
+    -- Overall statistics
+    COUNT(*) AS weeks_with_data,
+    SUM(total_earnings) AS total_earnings_12w,
+    AVG(weekly_performance_tier = 'EXCEPTIONAL') AS exceptional_week_rate,
+    AVG(weekly_performance_tier IN ('BELOW_AVERAGE', 'POOR')) AS poor_week_rate,
+
+    -- Consistency metrics
+    STDDEV(total_earnings) AS earnings_stddev,
+    AVG(consistency_rating = 'VERY_CONSISTENT') AS very_consistent_rate,
+
+    -- Growth trajectory
+    CORR(UNIX_DATE(week_start_date), total_earnings) AS earnings_trend_correlation,
+    CORR(UNIX_DATE(week_start_date), avg_rpm) AS rpm_trend_correlation,
+
+    -- Risk assessment
+    COUNTIF(ARRAY_LENGTH(risk_flags) > 0) AS weeks_with_risks,
+    ARRAY_CONCAT_AGG(risk_flags) AS all_risk_flags,
+
+    -- Strategic patterns
+    MODE(strategic_recommendation) AS most_common_recommendation
+
+  FROM latest_weeks
+  GROUP BY creator_username, creator_tier
+  HAVING weeks_with_data >= 4  -- Only include creators with sufficient data
+)
+
+SELECT
+  creator_username,
+  creator_tier,
+  weeks_with_data,
+
+  -- Performance comparison
+  ROUND(recent_avg_earnings, 2) AS recent_avg_earnings,
+  ROUND(previous_avg_earnings, 2) AS previous_avg_earnings,
+  ROUND((recent_avg_earnings - previous_avg_earnings) / NULLIF(previous_avg_earnings, 0), 4) AS earnings_trend_ratio,
+
+  ROUND(recent_avg_rpm, 4) AS recent_avg_rpm,
+  ROUND(previous_avg_rpm, 4) AS previous_avg_rpm,
+  ROUND((recent_avg_rpm - previous_avg_rpm) / NULLIF(previous_avg_rpm, 0), 4) AS rpm_trend_ratio,
+
+  -- Overall metrics
+  ROUND(total_earnings_12w, 2) AS total_earnings_12w,
+  ROUND(exceptional_week_rate, 3) AS exceptional_week_rate,
+  ROUND(poor_week_rate, 3) AS poor_week_rate,
+  ROUND(very_consistent_rate, 3) AS very_consistent_rate,
+
+  -- Trend strength
+  ROUND(earnings_trend_correlation, 3) AS earnings_trend_strength,
+  ROUND(rpm_trend_correlation, 3) AS rpm_trend_strength,
+
+  -- Overall trend classification
+  CASE
+    WHEN earnings_trend_correlation >= 0.7 THEN 'STRONG_UPWARD'
+    WHEN earnings_trend_correlation >= 0.3 THEN 'MODERATE_UPWARD'
+    WHEN earnings_trend_correlation >= -0.3 THEN 'STABLE'
+    WHEN earnings_trend_correlation >= -0.7 THEN 'MODERATE_DOWNWARD'
+    ELSE 'STRONG_DOWNWARD'
+  END AS overall_trend_direction,
+
+  -- Risk assessment
+  weeks_with_risks,
+  ROUND(weeks_with_risks / weeks_with_data, 3) AS risk_frequency,
+  (SELECT STRING_AGG(DISTINCT flag) FROM UNNEST(all_risk_flags) AS flag WHERE flag IS NOT NULL) AS unique_risk_flags,
+
+  -- Strategic summary
+  most_common_recommendation,
+
+  -- Performance tier assignment
+  CASE
+    WHEN recent_avg_rpm >= 2.0 AND earnings_trend_correlation >= 0.3 THEN 'STAR_PERFORMER'
+    WHEN recent_avg_rpm >= 1.25 AND earnings_trend_correlation >= 0.0 THEN 'SOLID_PERFORMER'
+    WHEN recent_avg_rpm >= 0.75 AND earnings_trend_correlation >= -0.3 THEN 'STABLE_PERFORMER'
+    WHEN earnings_trend_correlation < -0.5 THEN 'DECLINING_PERFORMER'
+    ELSE 'DEVELOPING_PERFORMER'
+  END AS performance_category,
+
+  CURRENT_TIMESTAMP() AS trends_calculated_at
+
+FROM trend_analysis
+ORDER BY recent_avg_earnings DESC, earnings_trend_correlation DESC
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'creator_weekly',
+  'SUCCESS',
+  'Created comprehensive weekly creator performance views with trend analysis and strategic insights',
+  CURRENT_TIMESTAMP()
+)
+
+-- Success message
+SELECT
+  'L1.03 COMPLETE' as status,
+  'Creator weekly performance views created with intelligent trend analysis and forecasting' as message,
+  CURRENT_TIMESTAMP() as completed_at

@@ -1,0 +1,467 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L0", "merge_loaders"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L0.04: Merge Loaders - Intelligent Data Processing
+-- =====================================================================
+-- Stored procedures for processing staging data into master tables
+-- with intelligent deduplication, quality scoring, and ML feature generation.
+-- =====================================================================
+
+-- =====================================================================
+-- MAIN INCREMENTAL MERGE PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_incremental_merge_messages`(
+  start_time TIMESTAMP,
+  end_time TIMESTAMP
+)
+BEGIN
+  DECLARE merge_id STRING DEFAULT GENERATE_UUID();
+  DECLARE processing_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE records_processed INT64 DEFAULT 0;
+  DECLARE records_inserted INT64 DEFAULT 0;
+  DECLARE records_updated INT64 DEFAULT 0;
+  DECLARE records_skipped INT64 DEFAULT 0;
+
+  -- Log start of processing
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.merge_log` (
+    merge_id, merge_timestamp, time_range_start, time_range_end, status
+  )
+  VALUES (
+    merge_id, processing_start, start_time, end_time, 'PROCESSING'
+  );
+
+  -- ===================================================================
+  -- STEP 1: Enrich staging data with calculated fields
+  -- ===================================================================
+
+  UPDATE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_incoming_stage`
+  SET
+    _processing_status = 'PROCESSING',
+    _quality_score = (
+      -- Quality scoring based on data completeness and validity
+      CASE WHEN message IS NOT NULL AND LENGTH(TRIM(message)) > 0 THEN 0.25 ELSE 0.0 END +
+      CASE WHEN sender IS NOT NULL AND LENGTH(TRIM(sender)) > 0 THEN 0.25 ELSE 0.0 END +
+      CASE WHEN sending_time IS NOT NULL AND sending_time != '' THEN 0.25 ELSE 0.0 END +
+      CASE WHEN COALESCE(sent, viewed, purchased) > 0 THEN 0.25 ELSE 0.0 END
+    ),
+    _anomaly_flags = ARRAY(
+      SELECT flag FROM UNNEST([
+        CASE WHEN LENGTH(message) > 2000 THEN 'MESSAGE_TOO_LONG' END,
+        CASE WHEN COALESCE(sent, 0) > 10000 THEN 'SENT_COUNT_HIGH' END,
+        CASE WHEN COALESCE(viewed, 0) > COALESCE(sent, 0) * 2 THEN 'VIEW_RATIO_HIGH' END,
+        CASE WHEN COALESCE(purchased, 0) > COALESCE(viewed, 0) THEN 'PURCHASE_RATIO_INVALID' END,
+        CASE WHEN COALESCE(earnings, 0) < 0 THEN 'NEGATIVE_EARNINGS' END
+      ]) AS flag
+      WHERE flag IS NOT NULL
+    )
+  WHERE loaded_at BETWEEN start_time AND end_time
+    AND _processing_status = 'PENDING';
+
+  -- Get count of records to process
+  SET records_processed = (
+    SELECT COUNT(*)
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_incoming_stage`
+    WHERE loaded_at BETWEEN start_time AND end_time
+      AND _processing_status = 'PROCESSING'
+  );
+
+  -- ===================================================================
+  -- STEP 2: Merge into master table with intelligent deduplication
+  -- ===================================================================
+
+  MERGE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` AS target
+  USING (
+    WITH staged_data AS (
+      SELECT
+        -- Generate deterministic row ID
+        SHA256(CONCAT(
+          COALESCE(sender, ''),
+          COALESCE(message, ''),
+          COALESCE(sending_time, ''),
+          COALESCE(message_id, '')
+        )) AS message_row_id,
+
+        -- Core fields with normalization
+        message,
+        SHA256(message) AS message_hash,
+
+        -- Parse sending time with multiple format support
+        CASE
+          WHEN sending_time IS NULL OR sending_time = '' THEN NULL
+          WHEN REGEXP_CONTAINS(sending_time, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}') THEN
+            PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', SUBSTR(sending_time, 1, 19))
+          WHEN REGEXP_CONTAINS(sending_time, r'^\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}:\d{2}') THEN
+            PARSE_TIMESTAMP('%m/%d/%Y %H:%M:%S', sending_time)
+          WHEN REGEXP_CONTAINS(sending_time, r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}') THEN
+            PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S', sending_time)
+          ELSE SAFE.PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S', sending_time)
+        END AS sending_time,
+
+        sender AS sender_original,
+        `${dataform.projectConfig.defaultProject}.layer_00_ingestion.normalize_username`(sender) AS sender_normalized,
+        status,
+        `${dataform.projectConfig.defaultProject}.layer_00_ingestion.safe_numeric`(price) AS price,
+
+        -- Engagement metrics
+        COALESCE(sent, 0) AS sent,
+        COALESCE(viewed, 0) AS viewed,
+        COALESCE(purchased, 0) AS purchased,
+        COALESCE(earnings, 0.0) AS earnings,
+
+        -- Calculate performance metrics
+        `layer_02_features.conversion_rate`(COALESCE(purchased, 0), COALESCE(viewed, 0)) AS conversion_rate,
+        `layer_02_features.calculate_rpm`(COALESCE(earnings, 0.0), COALESCE(sent, 0)) AS revenue_per_message,
+
+        -- Content analysis
+        LENGTH(message) AS char_length,
+        ARRAY_LENGTH(SPLIT(TRIM(message), ' ')) AS word_count,
+        `layer_02_features.count_emojis`(message) AS emoji_count,
+        `layer_02_features.has_placeholder`(message, 'hashtag') AS has_hashtag,
+        `layer_02_features.has_placeholder`(message, 'mention') AS has_mention,
+        `layer_02_features.has_placeholder`(message, 'price') AS has_price_placeholder,
+        `layer_02_features.has_placeholder`(message, 'name') AS has_name_placeholder,
+
+        -- Administrative fields
+        withdrawn_by,
+        message_id AS message_id_original,
+        [source_file] AS source_files,
+        loaded_at AS first_loaded_at,
+        _ingestion_id AS ingestion_batch_id,
+        _quality_score AS data_quality_score,
+        _anomaly_flags AS anomaly_flags
+
+      FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_incoming_stage`
+      WHERE loaded_at BETWEEN start_time AND end_time
+        AND _processing_status = 'PROCESSING'
+        AND _quality_score >= 0.5  -- Only process high-quality records
+    ),
+
+    enhanced_data AS (
+      SELECT
+        *,
+        -- Time-based features
+        EXTRACT(HOUR FROM sending_time) AS send_hour,
+        EXTRACT(DAYOFWEEK FROM sending_time) AS send_dayofweek,
+        DATE(sending_time) AS send_date,
+        `layer_02_features.hour_category`(EXTRACT(HOUR FROM sending_time)) AS hour_category,
+        `layer_02_features.day_category`(EXTRACT(DAYOFWEEK FROM sending_time)) AS day_category,
+
+        -- Engagement score calculation
+        CASE
+          WHEN sent > 0 AND viewed > 0 AND purchased > 0 THEN
+            (revenue_per_message * 0.4) +
+            (conversion_rate * 10 * 0.3) +
+            (LEAST(viewed / GREATEST(sent, 1), 2.0) * 0.3)
+          ELSE 0.0
+        END AS engagement_score,
+
+        -- Detect duplicates using window function
+        ROW_NUMBER() OVER (
+          PARTITION BY SHA256(CONCAT(COALESCE(sender_normalized, ''), COALESCE(message, '')))
+          ORDER BY first_loaded_at
+        ) AS duplicate_rank
+
+      FROM staged_data
+      WHERE sending_time IS NOT NULL  -- Only process records with valid timestamps
+    )
+
+    SELECT
+      *,
+      duplicate_rank > 1 AS is_duplicate,
+      SHA256(CONCAT(sender_normalized, message)) AS duplicate_group_id
+    FROM enhanced_data
+  ) AS source
+
+  ON target.message_row_id = source.message_row_id
+
+  -- Update existing records
+  WHEN MATCHED THEN UPDATE SET
+    sent = GREATEST(target.sent, source.sent),
+    viewed = GREATEST(target.viewed, source.viewed),
+    purchased = GREATEST(target.purchased, source.purchased),
+    earnings = GREATEST(target.earnings, source.earnings),
+    conversion_rate = `layer_02_features.conversion_rate`(
+      GREATEST(target.purchased, source.purchased),
+      GREATEST(target.viewed, source.viewed)
+    ),
+    revenue_per_message = `layer_02_features.calculate_rpm`(
+      GREATEST(target.earnings, source.earnings),
+      GREATEST(target.sent, source.sent)
+    ),
+    engagement_score = source.engagement_score,
+    source_files = ARRAY_CONCAT(target.source_files, source.source_files),
+    last_updated_at = CURRENT_TIMESTAMP(),
+    updated_at = CURRENT_TIMESTAMP()
+
+  -- Insert new records
+  WHEN NOT MATCHED THEN INSERT (
+    message_row_id, message, message_hash, sending_time,
+    sender_original, sender_normalized, status, price,
+    sent, viewed, purchased, earnings,
+    conversion_rate, revenue_per_message, engagement_score,
+    char_length, word_count, emoji_count,
+    has_hashtag, has_mention, has_price_placeholder, has_name_placeholder,
+    send_hour, send_dayofweek, send_date, hour_category, day_category,
+    withdrawn_by, message_id_original, source_files,
+    first_loaded_at, last_updated_at,
+    ingestion_batch_id, data_quality_score, is_duplicate,
+    duplicate_group_id, anomaly_flags,
+    created_at, updated_at
+  )
+  VALUES (
+    source.message_row_id, source.message, source.message_hash, source.sending_time,
+    source.sender_original, source.sender_normalized, source.status, source.price,
+    source.sent, source.viewed, source.purchased, source.earnings,
+    source.conversion_rate, source.revenue_per_message, source.engagement_score,
+    source.char_length, source.word_count, source.emoji_count,
+    source.has_hashtag, source.has_mention, source.has_price_placeholder, source.has_name_placeholder,
+    source.send_hour, source.send_dayofweek, source.send_date, source.hour_category, source.day_category,
+    source.withdrawn_by, source.message_id_original, source.source_files,
+    source.first_loaded_at, CURRENT_TIMESTAMP(),
+    source.ingestion_batch_id, source.data_quality_score, source.is_duplicate,
+    source.duplicate_group_id, source.anomaly_flags,
+    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+  );
+
+  -- Get merge statistics
+  SET records_inserted = @@row_count;
+
+  -- ===================================================================
+  -- STEP 3: Post-processing and ML feature enhancement
+  -- ===================================================================
+
+  -- Update creator tiers based on performance
+  CALL `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_update_creator_tiers`(start_time, end_time);
+
+  -- Update content classification
+  UPDATE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+  SET
+    content_category = CASE
+      WHEN has_price_placeholder OR price > 0 THEN 'PPV'
+      WHEN REGEXP_CONTAINS(UPPER(message), r'RENEW|REBILL|SUBSCRIPTION') THEN 'RENEW'
+      WHEN REGEXP_CONTAINS(UPPER(message), r'TIP|SUPPORT|SPOIL') THEN 'TIP'
+      WHEN REGEXP_CONTAINS(UPPER(message), r'NEW|FRESH|LATEST') THEN 'BUMP'
+      ELSE 'CUSTOM'
+    END,
+
+    novelty_score = (
+      SELECT 1.0 - COALESCE(
+        (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` m2
+         WHERE m2.sender_normalized = m1.sender_normalized
+           AND m2.message_hash = m1.message_hash
+           AND m2.created_at < m1.created_at
+        ) / 10.0, 0.0
+      )
+    ),
+
+    updated_at = CURRENT_TIMESTAMP()
+  FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master` m1
+  WHERE m1.send_date BETWEEN DATE(start_time) AND DATE(end_time)
+    AND m1.content_category IS NULL;
+
+  -- Mark staging records as processed
+  UPDATE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_incoming_stage`
+  SET _processing_status = 'COMPLETED'
+  WHERE loaded_at BETWEEN start_time AND end_time
+    AND _processing_status = 'PROCESSING';
+
+  -- ===================================================================
+  -- STEP 4: Log completion and statistics
+  -- ===================================================================
+
+  UPDATE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.merge_log`
+  SET
+    records_processed = records_processed,
+    records_inserted = records_inserted,
+    records_updated = 0,  -- TODO: Track updates separately
+    records_skipped = 0,  -- TODO: Track skipped records
+    processing_duration_seconds = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), processing_start, SECOND),
+    quality_summary = STRUCT(
+      (SELECT AVG(data_quality_score) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+       WHERE send_date BETWEEN DATE(start_time) AND DATE(end_time)) AS avg_quality_score,
+      (SELECT SUM(ARRAY_LENGTH(anomaly_flags)) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+       WHERE send_date BETWEEN DATE(start_time) AND DATE(end_time)) AS total_anomalies,
+      (SELECT AVG(CAST(is_duplicate AS INT64)) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+       WHERE send_date BETWEEN DATE(start_time) AND DATE(end_time)) AS duplicate_rate
+    ),
+    status = 'SUCCESS'
+  WHERE merge_id = merge_id;
+
+  -- Log to build log
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L0', 'merge_procedure',
+    'SUCCESS',
+    FORMAT('Processed %d records between %s and %s', records_processed, start_time, end_time),
+    CURRENT_TIMESTAMP()
+  );
+
+EXCEPTION WHEN ERROR THEN
+  -- Log error
+  UPDATE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.merge_log`
+  SET
+    status = 'FAILED',
+    error_message = @@error.message,
+    processing_duration_seconds = TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), processing_start, SECOND)
+  WHERE merge_id = merge_id;
+
+  -- Re-raise the error
+  RAISE USING MESSAGE = @@error.message;
+END;
+
+-- =====================================================================
+-- CREATOR TIER UPDATE PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_update_creator_tiers`(
+  start_time TIMESTAMP,
+  end_time TIMESTAMP
+)
+BEGIN
+  -- Update creator profiles based on recent performance
+  MERGE `reference.creator_profiles` AS target
+  USING (
+    WITH creator_stats AS (
+      SELECT
+        sender_normalized,
+        COUNT(*) AS total_messages,
+        AVG(revenue_per_message) AS avg_rpm,
+        AVG(conversion_rate) AS avg_conversion,
+        SUM(earnings) AS total_earnings,
+        MAX(send_date) AS last_activity_date
+      FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+      WHERE send_date BETWEEN DATE(start_time) AND DATE(end_time)
+        AND sender_normalized IS NOT NULL
+      GROUP BY sender_normalized
+    ),
+
+    tier_calculations AS (
+      SELECT
+        sender_normalized AS username_std,
+        CASE
+          WHEN avg_rpm >= 2.0 AND avg_conversion >= 0.08 THEN 'PREMIUM'
+          WHEN avg_rpm >= 1.25 AND avg_conversion >= 0.06 THEN 'HIGH'
+          WHEN avg_rpm >= 0.75 AND avg_conversion >= 0.04 THEN 'MED'
+          WHEN avg_rpm >= 0.25 AND avg_conversion >= 0.02 THEN 'LOW'
+          ELSE 'NEW'
+        END AS calculated_tier,
+        avg_rpm,
+        avg_conversion,
+        total_messages,
+        total_earnings,
+        last_activity_date
+      FROM creator_stats
+    )
+
+    SELECT * FROM tier_calculations
+  ) AS source
+
+  ON target.username_std = source.username_std
+
+  WHEN MATCHED THEN UPDATE SET
+    creator_tier = source.calculated_tier,
+    baseline_rpm = source.avg_rpm,
+    baseline_conversion_rate = source.avg_conversion,
+    updated_at = CURRENT_TIMESTAMP()
+
+  WHEN NOT MATCHED THEN INSERT (
+    username_std, creator_tier, onboarding_date,
+    baseline_rpm, baseline_conversion_rate,
+    created_at, updated_at
+  )
+  VALUES (
+    source.username_std, source.calculated_tier, CURRENT_DATE(),
+    source.avg_rpm, source.avg_conversion,
+    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- WEEKLY STATS MERGE PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_merge_weekly_stats`()
+BEGIN
+  DECLARE merge_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+
+  MERGE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.creator_stats_weekly_raw` AS target
+  USING (
+    SELECT
+      DATE_TRUNC(send_date, WEEK(MONDAY)) AS week_start_date,
+      sender_normalized AS username_std,
+      COUNT(*) AS sent,
+      SUM(viewed) AS viewed,
+      SUM(purchased) AS purchased,
+      SUM(earnings) AS earnings,
+      AVG(conversion_rate) AS conversion_rate,
+      AVG(revenue_per_message) AS rpm,
+      AVG(CAST(viewed AS NUMERIC) / GREATEST(sent, 1)) AS engagement_rate,
+      'calculated_from_master' AS source_file,
+      CURRENT_TIMESTAMP() AS loaded_at
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+    WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 8 WEEK)
+      AND sender_normalized IS NOT NULL
+    GROUP BY 1, 2
+  ) AS source
+
+  ON target.week_start_date = source.week_start_date
+     AND target.username_std = source.username_std
+
+  WHEN MATCHED THEN UPDATE SET
+    sent = GREATEST(target.sent, source.sent),
+    viewed = GREATEST(target.viewed, source.viewed),
+    purchased = GREATEST(target.purchased, source.purchased),
+    earnings = GREATEST(target.earnings, source.earnings),
+    conversion_rate = source.conversion_rate,
+    rpm = source.rpm,
+    engagement_rate = source.engagement_rate
+
+  WHEN NOT MATCHED THEN INSERT VALUES (
+    source.week_start_date, source.username_std,
+    source.sent, source.viewed, source.purchased, source.earnings,
+    source.conversion_rate, source.rpm, source.engagement_rate,
+    source.source_file, source.loaded_at, CURRENT_TIMESTAMP()
+  );
+
+  -- Log completion
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L0', 'weekly_merge',
+    'SUCCESS',
+    FORMAT('Updated weekly stats for %d creators', @@row_count),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L0', 'merge_loaders',
+  'SUCCESS',
+  'Created intelligent merge procedures with ML feature generation',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L0.04 COMPLETE' as status,
+  'Created merge procedures with intelligent deduplication and ML features' as message,
+  CURRENT_TIMESTAMP() as completed_at;

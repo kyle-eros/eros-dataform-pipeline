@@ -1,0 +1,502 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L4", "sanity_checks"],
+  dependencies: ["eros_L3_01_ops_config", "eros_L3_02_next24"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L4.05: ML Layer Sanity Checks and Monitoring
+-- ================================================================
+-- Comprehensive checks for ML model health and prediction quality
+-- Monitors data drift, model performance, and system reliability
+-- ================================================================
+
+-- Check 1: ML Model Training Data Quality
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_sanity_training_data_quality` AS
+WITH data_quality_metrics AS (
+  SELECT
+    'message_performance' AS dataset,
+    COUNT(*) AS total_records,
+    COUNT(DISTINCT creator_name) AS unique_creators,
+    COUNTIF(is_complete_record = 1) AS complete_records,
+    COUNTIF(view_rate BETWEEN 0 AND 1) AS valid_view_rates,
+    COUNTIF(conversion_rate BETWEEN 0 AND 1) AS valid_conversion_rates,
+    AVG(view_rate) AS avg_view_rate,
+    AVG(conversion_rate) AS avg_conversion_rate,
+    MIN(event_timestamp) AS earliest_date,
+    MAX(event_timestamp) AS latest_date
+  FROM `of-scheduler-proj.layer_04_ml.v_training_message_performance`
+
+  UNION ALL
+
+  SELECT
+    'optimal_timing',
+    COUNT(*),
+    COUNT(DISTINCT creator_name),
+    COUNT(*) AS complete_records,
+    COUNTIF(avg_view_rate BETWEEN 0 AND 1),
+    COUNTIF(avg_conversion_rate BETWEEN 0 AND 1),
+    AVG(avg_view_rate),
+    AVG(avg_conversion_rate),
+    NULL,
+    NULL
+  FROM `of-scheduler-proj.layer_04_ml.v_training_optimal_timing`
+
+  UNION ALL
+
+  SELECT
+    'content_features',
+    COUNT(*),
+    COUNT(DISTINCT creator_name),
+    COUNT(*),
+    COUNTIF(view_rate BETWEEN 0 AND 1),
+    COUNTIF(conversion_rate BETWEEN 0 AND 1),
+    AVG(view_rate),
+    AVG(conversion_rate),
+    MIN(event_timestamp),
+    MAX(event_timestamp)
+  FROM `of-scheduler-proj.layer_04_ml.v_training_content_features`
+)
+
+SELECT
+  dataset,
+  total_records,
+  unique_creators,
+  complete_records,
+  ROUND(complete_records / total_records * 100, 1) AS completeness_percentage,
+
+  valid_view_rates,
+  ROUND(valid_view_rates / total_records * 100, 1) AS valid_view_rate_percentage,
+
+  valid_conversion_rates,
+  ROUND(valid_conversion_rates / total_records * 100, 1) AS valid_conversion_rate_percentage,
+
+  ROUND(avg_view_rate, 4) AS avg_view_rate,
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+
+  earliest_date,
+  latest_date,
+  DATE_DIFF(CURRENT_DATE(), DATE(latest_date), DAY) AS days_since_latest,
+
+  -- Quality flags
+  CASE
+    WHEN completeness_percentage < 80 THEN '🔴 Poor data completeness'
+    WHEN completeness_percentage < 95 THEN '🟡 Fair data completeness'
+    ELSE '🟢 Good data completeness'
+  END AS data_quality_flag,
+
+  CASE
+    WHEN total_records < 1000 THEN '🔴 Insufficient training data'
+    WHEN total_records < 5000 THEN '🟡 Limited training data'
+    ELSE '🟢 Adequate training data'
+  END AS volume_flag
+
+FROM data_quality_metrics
+;
+
+-- Check 2: ML Model Prediction Consistency
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_sanity_prediction_consistency` AS
+WITH prediction_stats AS (
+  SELECT
+    COUNT(*) AS total_predictions,
+    COUNT(DISTINCT creator_name) AS unique_creators,
+
+    -- View rate predictions
+    AVG(predicted_view_rate) AS avg_predicted_view_rate,
+    STDDEV(predicted_view_rate) AS stddev_predicted_view_rate,
+    MIN(predicted_view_rate) AS min_predicted_view_rate,
+    MAX(predicted_view_rate) AS max_predicted_view_rate,
+    COUNTIF(predicted_view_rate IS NULL) AS null_view_rate_predictions,
+
+    -- Conversion rate predictions
+    AVG(predicted_conversion_rate) AS avg_predicted_conversion_rate,
+    STDDEV(predicted_conversion_rate) AS stddev_predicted_conversion_rate,
+    MIN(predicted_conversion_rate) AS min_predicted_conversion_rate,
+    MAX(predicted_conversion_rate) AS max_predicted_conversion_rate,
+    COUNTIF(predicted_conversion_rate IS NULL) AS null_conversion_rate_predictions,
+
+    -- ML score distribution
+    AVG(ml_enhanced_score) AS avg_ml_score,
+    STDDEV(ml_enhanced_score) AS stddev_ml_score,
+    COUNTIF(ml_enhanced_score > 50) AS high_score_count,
+    COUNTIF(ml_enhanced_score BETWEEN 30 AND 50) AS medium_score_count,
+    COUNTIF(ml_enhanced_score < 30) AS low_score_count,
+
+    -- Confidence distribution
+    COUNTIF(prediction_confidence = 'HIGH') AS high_confidence_count,
+    COUNTIF(prediction_confidence = 'MEDIUM') AS medium_confidence_count,
+    COUNTIF(prediction_confidence = 'LOW') AS low_confidence_count
+
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+),
+
+consistency_checks AS (
+  SELECT
+    *,
+
+    -- Prediction range checks
+    CASE
+      WHEN min_predicted_view_rate < 0 OR max_predicted_view_rate > 1
+      THEN '🔴 View rate predictions out of valid range'
+      WHEN stddev_predicted_view_rate > 0.3
+      THEN '🟡 High variance in view rate predictions'
+      ELSE '🟢 View rate predictions look consistent'
+    END AS view_rate_check,
+
+    CASE
+      WHEN min_predicted_conversion_rate < 0 OR max_predicted_conversion_rate > 1
+      THEN '🔴 Conversion rate predictions out of valid range'
+      WHEN stddev_predicted_conversion_rate > 0.2
+      THEN '🟡 High variance in conversion rate predictions'
+      ELSE '🟢 Conversion rate predictions look consistent'
+    END AS conversion_rate_check,
+
+    -- Null prediction checks
+    CASE
+      WHEN null_view_rate_predictions > 0 OR null_conversion_rate_predictions > 0
+      THEN '🔴 Found NULL predictions - model serving issue'
+      ELSE '🟢 No NULL predictions'
+    END AS null_check,
+
+    -- Score distribution check
+    CASE
+      WHEN high_score_count = 0
+      THEN '🔴 No high-scoring recommendations - model may be broken'
+      WHEN high_score_count / total_predictions < 0.1
+      THEN '🟡 Very few high-scoring recommendations'
+      ELSE '🟢 Healthy score distribution'
+    END AS score_distribution_check
+
+  FROM prediction_stats
+)
+
+SELECT
+  total_predictions,
+  unique_creators,
+
+  -- Prediction statistics
+  ROUND(avg_predicted_view_rate, 4) AS avg_predicted_view_rate,
+  ROUND(stddev_predicted_view_rate, 4) AS stddev_predicted_view_rate,
+  ROUND(min_predicted_view_rate, 4) AS min_predicted_view_rate,
+  ROUND(max_predicted_view_rate, 4) AS max_predicted_view_rate,
+
+  ROUND(avg_predicted_conversion_rate, 4) AS avg_predicted_conversion_rate,
+  ROUND(stddev_predicted_conversion_rate, 4) AS stddev_predicted_conversion_rate,
+  ROUND(min_predicted_conversion_rate, 4) AS min_predicted_conversion_rate,
+  ROUND(max_predicted_conversion_rate, 4) AS max_predicted_conversion_rate,
+
+  -- ML score statistics
+  ROUND(avg_ml_score, 2) AS avg_ml_score,
+  ROUND(stddev_ml_score, 2) AS stddev_ml_score,
+
+  -- Distribution counts
+  high_score_count,
+  medium_score_count,
+  low_score_count,
+  high_confidence_count,
+  medium_confidence_count,
+  low_confidence_count,
+
+  -- Health checks
+  view_rate_check,
+  conversion_rate_check,
+  null_check,
+  score_distribution_check,
+
+  -- Overall health
+  CASE
+    WHEN view_rate_check LIKE '🔴%' OR conversion_rate_check LIKE '🔴%'
+         OR null_check LIKE '🔴%' OR score_distribution_check LIKE '🔴%'
+    THEN '🔴 ML SYSTEM UNHEALTHY'
+    WHEN view_rate_check LIKE '🟡%' OR conversion_rate_check LIKE '🟡%'
+         OR score_distribution_check LIKE '🟡%'
+    THEN '🟡 ML SYSTEM NEEDS ATTENTION'
+    ELSE '🟢 ML SYSTEM HEALTHY'
+  END AS overall_ml_health
+
+FROM consistency_checks
+;
+
+-- Check 3: Data Freshness and Recency
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_sanity_data_freshness` AS
+WITH freshness_metrics AS (
+  SELECT
+    'ML Recommendations' AS data_source,
+    MAX(generated_at) AS latest_timestamp,
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(generated_at), MINUTE) AS minutes_since_latest,
+    COUNT(*) AS total_records,
+    COUNT(DISTINCT creator_name) AS unique_creators
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+
+  UNION ALL
+
+  SELECT
+    'Training Data - Message Performance',
+    MAX(event_timestamp),
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(event_timestamp), MINUTE),
+    COUNT(*),
+    COUNT(DISTINCT creator_name)
+  FROM `of-scheduler-proj.layer_04_ml.v_training_message_performance`
+
+  UNION ALL
+
+  SELECT
+    'Source Data - Mass Messages',
+    MAX(sending_time),
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(sending_time), MINUTE),
+    COUNT(*),
+    COUNT(DISTINCT sender)
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+)
+
+SELECT
+  data_source,
+  latest_timestamp,
+  minutes_since_latest,
+  ROUND(minutes_since_latest / 60.0, 1) AS hours_since_latest,
+  total_records,
+  unique_creators,
+
+  -- Freshness flags
+  CASE
+    WHEN data_source = 'ML Recommendations' THEN
+      CASE
+        WHEN minutes_since_latest > 120 THEN '🔴 Recommendations stale (>2h)'
+        WHEN minutes_since_latest > 60 THEN '🟡 Recommendations aging (>1h)'
+        ELSE '🟢 Recommendations fresh'
+      END
+    WHEN data_source LIKE 'Training Data%' THEN
+      CASE
+        WHEN minutes_since_latest > 1440 THEN '🔴 Training data stale (>24h)'
+        WHEN minutes_since_latest > 720 THEN '🟡 Training data aging (>12h)'
+        ELSE '🟢 Training data fresh'
+      END
+    ELSE
+      CASE
+        WHEN minutes_since_latest > 360 THEN '🔴 Source data stale (>6h)'
+        WHEN minutes_since_latest > 180 THEN '🟡 Source data aging (>3h)'
+        ELSE '🟢 Source data fresh'
+      END
+  END AS freshness_flag
+
+FROM freshness_metrics
+ORDER BY
+  CASE data_source
+    WHEN 'ML Recommendations' THEN 1
+    WHEN 'Source Data - Mass Messages' THEN 2
+    ELSE 3
+  END
+;
+
+-- Check 4: Creator Coverage and Fairness
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_sanity_creator_coverage` AS
+WITH creator_metrics AS (
+  SELECT
+    creator_name,
+    creator_tier,
+    COUNT(*) AS recommendation_count,
+    AVG(ml_enhanced_score) AS avg_ml_score,
+    MAX(ml_enhanced_score) AS max_ml_score,
+    MIN(creator_rank) AS best_rank,
+    COUNTIF(recommendation_quality = 'EXCELLENT') AS excellent_count,
+    COUNTIF(prediction_confidence = 'HIGH') AS high_confidence_count
+
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+  GROUP BY creator_name, creator_tier
+),
+
+coverage_stats AS (
+  SELECT
+    creator_tier,
+    COUNT(*) AS creators_in_tier,
+    AVG(recommendation_count) AS avg_recommendations_per_creator,
+    AVG(avg_ml_score) AS tier_avg_ml_score,
+    AVG(excellent_count) AS avg_excellent_per_creator,
+    SUM(recommendation_count) AS total_recommendations_in_tier
+
+  FROM creator_metrics
+  GROUP BY creator_tier
+),
+
+fairness_analysis AS (
+  SELECT
+    *,
+    total_recommendations_in_tier / SUM(total_recommendations_in_tier) OVER () AS tier_recommendation_share,
+
+    -- Expected distribution based on tier (higher tiers should get more)
+    CASE creator_tier
+      WHEN 'PLATINUM' THEN 0.4
+      WHEN 'GOLD' THEN 0.3
+      WHEN 'SILVER' THEN 0.2
+      ELSE 0.1
+    END AS expected_share
+
+  FROM coverage_stats
+)
+
+SELECT
+  creator_tier,
+  creators_in_tier,
+  ROUND(avg_recommendations_per_creator, 1) AS avg_recommendations_per_creator,
+  ROUND(tier_avg_ml_score, 2) AS tier_avg_ml_score,
+  ROUND(avg_excellent_per_creator, 1) AS avg_excellent_per_creator,
+
+  total_recommendations_in_tier,
+  ROUND(tier_recommendation_share * 100, 1) AS actual_share_percentage,
+  ROUND(expected_share * 100, 1) AS expected_share_percentage,
+
+  -- Fairness check
+  CASE
+    WHEN ABS(tier_recommendation_share - expected_share) > 0.15
+    THEN '🔴 Significant bias detected'
+    WHEN ABS(tier_recommendation_share - expected_share) > 0.10
+    THEN '🟡 Moderate bias detected'
+    ELSE '🟢 Fair distribution'
+  END AS fairness_flag
+
+FROM fairness_analysis
+ORDER BY
+  CASE creator_tier
+    WHEN 'PLATINUM' THEN 1
+    WHEN 'GOLD' THEN 2
+    WHEN 'SILVER' THEN 3
+    ELSE 4
+  END
+;
+
+-- Check 5: Performance Validation Against Historical Data
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_sanity_performance_validation` AS
+WITH recent_actuals AS (
+  SELECT
+    sender AS creator_name,
+    DATE(sending_time) AS message_date,
+    EXTRACT(HOUR FROM sending_time) AS send_hour,
+    AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) AS actual_view_rate,
+    AVG(CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END) AS actual_conversion_rate,
+    AVG(earnings / GREATEST(sent, 1)) AS actual_revenue_per_message,
+    COUNT(*) AS message_count
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+    AND sent > 0
+  GROUP BY creator_name, message_date, send_hour
+  HAVING message_count >= 1
+),
+
+current_predictions AS (
+  SELECT
+    creator_name,
+    send_hour,
+    AVG(predicted_view_rate) AS avg_predicted_view_rate,
+    AVG(predicted_conversion_rate) AS avg_predicted_conversion_rate,
+    AVG(predicted_base_revenue) AS avg_predicted_revenue,
+    COUNT(*) AS prediction_count
+
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+  GROUP BY creator_name, send_hour
+),
+
+validation_comparison AS (
+  SELECT
+    a.creator_name,
+    a.send_hour,
+    a.actual_view_rate,
+    a.actual_conversion_rate,
+    a.actual_revenue_per_message,
+    p.avg_predicted_view_rate,
+    p.avg_predicted_conversion_rate,
+    p.avg_predicted_revenue,
+
+    -- Calculate prediction errors
+    ABS(a.actual_view_rate - p.avg_predicted_view_rate) AS view_rate_error,
+    ABS(a.actual_conversion_rate - p.avg_predicted_conversion_rate) AS conversion_rate_error,
+    ABS(a.actual_revenue_per_message - p.avg_predicted_revenue) AS revenue_error,
+
+    -- Calculate relative errors
+    ABS(a.actual_view_rate - p.avg_predicted_view_rate) / NULLIF(a.actual_view_rate, 0) AS view_rate_relative_error,
+    ABS(a.actual_conversion_rate - p.avg_predicted_conversion_rate) / NULLIF(a.actual_conversion_rate, 0) AS conversion_rate_relative_error
+
+  FROM recent_actuals a
+  JOIN current_predictions p
+    ON a.creator_name = p.creator_name
+    AND a.send_hour = p.send_hour
+  WHERE a.actual_view_rate > 0 AND a.actual_conversion_rate > 0
+),
+
+error_summary AS (
+  SELECT
+    COUNT(*) AS comparison_count,
+    AVG(view_rate_error) AS avg_view_rate_mae,
+    AVG(conversion_rate_error) AS avg_conversion_rate_mae,
+    AVG(revenue_error) AS avg_revenue_mae,
+    AVG(view_rate_relative_error) AS avg_view_rate_mape,
+    AVG(conversion_rate_relative_error) AS avg_conversion_rate_mape,
+
+    -- Count of significant errors
+    COUNTIF(view_rate_relative_error > 0.5) AS high_view_rate_error_count,
+    COUNTIF(conversion_rate_relative_error > 0.5) AS high_conversion_rate_error_count
+
+  FROM validation_comparison
+)
+
+SELECT
+  comparison_count,
+  ROUND(avg_view_rate_mae, 4) AS avg_view_rate_mae,
+  ROUND(avg_conversion_rate_mae, 4) AS avg_conversion_rate_mae,
+  ROUND(avg_revenue_mae, 2) AS avg_revenue_mae,
+  ROUND(avg_view_rate_mape * 100, 1) AS avg_view_rate_mape_percent,
+  ROUND(avg_conversion_rate_mape * 100, 1) AS avg_conversion_rate_mape_percent,
+
+  high_view_rate_error_count,
+  high_conversion_rate_error_count,
+
+  -- Performance flags
+  CASE
+    WHEN avg_view_rate_mape > 0.3 THEN '🔴 Poor view rate prediction accuracy'
+    WHEN avg_view_rate_mape > 0.2 THEN '🟡 Fair view rate prediction accuracy'
+    ELSE '🟢 Good view rate prediction accuracy'
+  END AS view_rate_accuracy_flag,
+
+  CASE
+    WHEN avg_conversion_rate_mape > 0.4 THEN '🔴 Poor conversion rate prediction accuracy'
+    WHEN avg_conversion_rate_mape > 0.3 THEN '🟡 Fair conversion rate prediction accuracy'
+    ELSE '🟢 Good conversion rate prediction accuracy'
+  END AS conversion_rate_accuracy_flag
+
+FROM error_summary
+;
+
+-- Master sanity check summary
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_04_ml.v_sanity_ml_system_health` AS
+SELECT
+  CURRENT_TIMESTAMP() AS check_timestamp,
+
+  -- Training data health
+  (SELECT data_quality_flag FROM `of-scheduler-proj.layer_04_ml.v_sanity_training_data_quality` WHERE dataset = 'message_performance') AS training_data_health,
+
+  -- Prediction consistency
+  (SELECT overall_ml_health FROM `of-scheduler-proj.layer_04_ml.v_sanity_prediction_consistency`) AS prediction_health,
+
+  -- Data freshness
+  (SELECT freshness_flag FROM `of-scheduler-proj.layer_04_ml.v_sanity_data_freshness` WHERE data_source = 'ML Recommendations') AS freshness_health,
+
+  -- Creator fairness
+  (SELECT STRING_AGG(CONCAT(creator_tier, ': ', fairness_flag), ' | ') FROM `of-scheduler-proj.layer_04_ml.v_sanity_creator_coverage`) AS fairness_health,
+
+  -- Performance validation
+  (SELECT CONCAT(view_rate_accuracy_flag, ' | ', conversion_rate_accuracy_flag) FROM `of-scheduler-proj.layer_04_ml.v_sanity_performance_validation`) AS accuracy_health,
+
+  -- Overall system status
+  CASE
+    WHEN (SELECT overall_ml_health FROM `of-scheduler-proj.layer_04_ml.v_sanity_prediction_consistency`) LIKE '🔴%'
+      OR (SELECT freshness_flag FROM `of-scheduler-proj.layer_04_ml.v_sanity_data_freshness` WHERE data_source = 'ML Recommendations') LIKE '🔴%'
+    THEN '🔴 ML SYSTEM CRITICAL - IMMEDIATE ATTENTION REQUIRED'
+    WHEN (SELECT overall_ml_health FROM `of-scheduler-proj.layer_04_ml.v_sanity_prediction_consistency`) LIKE '🟡%'
+      OR (SELECT freshness_flag FROM `of-scheduler-proj.layer_04_ml.v_sanity_data_freshness` WHERE data_source = 'ML Recommendations') LIKE '🟡%'
+    THEN '🟡 ML SYSTEM DEGRADED - MONITORING REQUIRED'
+    ELSE '🟢 ML SYSTEM HEALTHY'
+  END AS overall_system_status
+;

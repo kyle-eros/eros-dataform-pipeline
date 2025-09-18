@@ -1,0 +1,478 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L0", "sanity_checks"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L0.05: Sanity Checks - Data Quality and Integrity Monitoring
+-- =====================================================================
+-- Views and procedures for monitoring data quality, detecting anomalies,
+-- and ensuring system health with intelligent alerting capabilities.
+-- =====================================================================
+
+-- =====================================================================
+-- DUPLICATE DETECTION VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_sanity_duplicates` AS
+SELECT
+  duplicate_group_id,
+  COUNT(*) AS duplicate_count,
+  ARRAY_AGG(DISTINCT sender_normalized) AS affected_creators,
+  ARRAY_AGG(DISTINCT send_date ORDER BY send_date) AS dates_affected,
+  ARRAY_AGG(message_row_id ORDER BY created_at LIMIT 5) AS sample_row_ids,
+  MIN(created_at) AS first_seen,
+  MAX(created_at) AS last_seen,
+  SUM(earnings) AS total_earnings_affected,
+  AVG(data_quality_score) AS avg_quality_score
+FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+WHERE is_duplicate = TRUE
+  AND duplicate_group_id IS NOT NULL
+GROUP BY duplicate_group_id
+HAVING COUNT(*) > 1
+ORDER BY duplicate_count DESC, total_earnings_affected DESC;
+
+-- =====================================================================
+-- DATA QUALITY MONITORING VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_data_quality_summary` AS
+WITH daily_quality AS (
+  SELECT
+    send_date,
+    COUNT(*) AS total_records,
+
+    -- Completeness metrics
+    COUNTIF(message IS NOT NULL AND LENGTH(TRIM(message)) > 0) AS messages_complete,
+    COUNTIF(sender_normalized IS NOT NULL) AS senders_complete,
+    COUNTIF(sending_time IS NOT NULL) AS timestamps_complete,
+
+    -- Quality scores
+    AVG(data_quality_score) AS avg_quality_score,
+    COUNTIF(data_quality_score >= 0.8) AS high_quality_count,
+    COUNTIF(data_quality_score < 0.5) AS low_quality_count,
+
+    -- Anomaly detection
+    COUNTIF(ARRAY_LENGTH(anomaly_flags) > 0) AS records_with_anomalies,
+    ARRAY_LENGTH(ARRAY_CONCAT_AGG(anomaly_flags)) AS total_anomalies,
+
+    -- Business metrics
+    SUM(earnings) AS total_earnings,
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+
+    -- Content quality
+    AVG(char_length) AS avg_message_length,
+    COUNTIF(emoji_count > 0) AS messages_with_emojis,
+    COUNTIF(has_price_placeholder) AS messages_with_pricing,
+
+    CURRENT_TIMESTAMP() AS calculated_at
+  FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  GROUP BY send_date
+)
+
+SELECT
+  send_date,
+  total_records,
+
+  -- Completeness percentages
+  ROUND(messages_complete / total_records * 100, 2) AS message_completeness_pct,
+  ROUND(senders_complete / total_records * 100, 2) AS sender_completeness_pct,
+  ROUND(timestamps_complete / total_records * 100, 2) AS timestamp_completeness_pct,
+
+  -- Quality metrics
+  ROUND(avg_quality_score, 3) AS avg_quality_score,
+  ROUND(high_quality_count / total_records * 100, 2) AS high_quality_pct,
+  ROUND(low_quality_count / total_records * 100, 2) AS low_quality_pct,
+
+  -- Anomaly rates
+  ROUND(records_with_anomalies / total_records * 100, 2) AS anomaly_rate_pct,
+  total_anomalies,
+
+  -- Business health
+  total_earnings,
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+
+  -- Content insights
+  ROUND(avg_message_length, 1) AS avg_message_length,
+  ROUND(messages_with_emojis / total_records * 100, 2) AS emoji_usage_pct,
+  ROUND(messages_with_pricing / total_records * 100, 2) AS pricing_message_pct,
+
+  -- Data quality status
+  CASE
+    WHEN avg_quality_score >= 0.8 AND (records_with_anomalies / total_records * 100) <= 5 THEN 'EXCELLENT'
+    WHEN avg_quality_score >= 0.6 AND (records_with_anomalies / total_records * 100) <= 10 THEN 'GOOD'
+    WHEN avg_quality_score >= 0.4 AND (records_with_anomalies / total_records * 100) <= 20 THEN 'FAIR'
+    ELSE 'POOR'
+  END AS quality_status,
+
+  calculated_at
+
+FROM daily_quality
+ORDER BY send_date DESC;
+
+-- =====================================================================
+-- ANOMALY DETECTION VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_anomaly_detection` AS
+WITH anomaly_analysis AS (
+  SELECT
+    send_date,
+    sender_normalized,
+
+    -- Volume anomalies
+    COUNT(*) AS daily_message_count,
+    AVG(COUNT(*)) OVER (
+      PARTITION BY sender_normalized
+      ORDER BY send_date
+      ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
+    ) AS avg_weekly_volume,
+
+    -- Performance anomalies
+    AVG(conversion_rate) AS daily_conversion,
+    AVG(AVG(conversion_rate)) OVER (
+      PARTITION BY sender_normalized
+      ORDER BY send_date
+      ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
+    ) AS avg_weekly_conversion,
+
+    AVG(revenue_per_message) AS daily_rpm,
+    AVG(AVG(revenue_per_message)) OVER (
+      PARTITION BY sender_normalized
+      ORDER BY send_date
+      ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
+    ) AS avg_weekly_rpm,
+
+    -- Content anomalies
+    AVG(char_length) AS avg_message_length,
+    COUNTIF(emoji_count = 0) / COUNT(*) AS no_emoji_rate,
+    COUNTIF(novelty_score < 0.3) / COUNT(*) AS low_novelty_rate,
+
+    -- Timing anomalies
+    COUNTIF(send_hour BETWEEN 2 AND 6) / COUNT(*) AS night_send_rate,
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+
+    SUM(earnings) AS daily_earnings
+
+  FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND sender_normalized IS NOT NULL
+  GROUP BY send_date, sender_normalized
+)
+
+SELECT
+  send_date,
+  sender_normalized,
+  daily_message_count,
+  daily_earnings,
+
+  -- Volume anomaly detection
+  CASE
+    WHEN avg_weekly_volume > 0 AND daily_message_count > avg_weekly_volume * 2 THEN 'HIGH_VOLUME'
+    WHEN avg_weekly_volume > 0 AND daily_message_count < avg_weekly_volume * 0.3 THEN 'LOW_VOLUME'
+    ELSE NULL
+  END AS volume_anomaly,
+
+  -- Performance anomaly detection
+  CASE
+    WHEN avg_weekly_conversion > 0 AND daily_conversion < avg_weekly_conversion * 0.5 THEN 'LOW_CONVERSION'
+    WHEN avg_weekly_conversion > 0 AND daily_conversion > avg_weekly_conversion * 2 THEN 'HIGH_CONVERSION'
+    ELSE NULL
+  END AS conversion_anomaly,
+
+  CASE
+    WHEN avg_weekly_rpm > 0 AND daily_rpm < avg_weekly_rpm * 0.5 THEN 'LOW_RPM'
+    WHEN avg_weekly_rpm > 0 AND daily_rpm > avg_weekly_rpm * 2 THEN 'HIGH_RPM'
+    ELSE NULL
+  END AS rpm_anomaly,
+
+  -- Content anomaly detection
+  CASE
+    WHEN no_emoji_rate > 0.8 THEN 'NO_EMOJIS'
+    WHEN low_novelty_rate > 0.7 THEN 'LOW_NOVELTY'
+    WHEN avg_message_length < 10 THEN 'SHORT_MESSAGES'
+    WHEN avg_message_length > 500 THEN 'LONG_MESSAGES'
+    ELSE NULL
+  END AS content_anomaly,
+
+  -- Timing anomaly detection
+  CASE
+    WHEN night_send_rate > 0.5 THEN 'NIGHT_SENDING'
+    WHEN hour_diversity <= 2 THEN 'LIMITED_TIMING'
+    ELSE NULL
+  END AS timing_anomaly,
+
+  -- Overall anomaly score (0-1)
+  (
+    CASE WHEN volume_anomaly IS NOT NULL THEN 0.25 ELSE 0 END +
+    CASE WHEN conversion_anomaly IS NOT NULL THEN 0.25 ELSE 0 END +
+    CASE WHEN rpm_anomaly IS NOT NULL THEN 0.25 ELSE 0 END +
+    CASE WHEN content_anomaly IS NOT NULL OR timing_anomaly IS NOT NULL THEN 0.25 ELSE 0 END
+  ) AS anomaly_score,
+
+  CURRENT_TIMESTAMP() AS calculated_at
+
+FROM anomaly_analysis
+WHERE (
+  daily_message_count > avg_weekly_volume * 2
+  OR daily_message_count < avg_weekly_volume * 0.3
+  OR daily_conversion < avg_weekly_conversion * 0.5
+  OR daily_conversion > avg_weekly_conversion * 2
+  OR daily_rpm < avg_weekly_rpm * 0.5
+  OR daily_rpm > avg_weekly_rpm * 2
+  OR no_emoji_rate > 0.8
+  OR low_novelty_rate > 0.7
+  OR night_send_rate > 0.5
+  OR hour_diversity <= 2
+)
+ORDER BY anomaly_score DESC, send_date DESC;
+
+-- =====================================================================
+-- SYSTEM HEALTH MONITORING VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_system_health` AS
+WITH health_metrics AS (
+  SELECT
+    -- Data freshness
+    MAX(loaded_at) AS latest_data_load,
+    MAX(send_date) AS latest_message_date,
+    COUNT(DISTINCT send_date) AS days_with_data,
+
+    -- Processing health
+    COUNT(*) AS total_records,
+    COUNTIF(sending_time IS NOT NULL) AS parsed_timestamps,
+    COUNTIF(data_quality_score >= 0.5) AS quality_records,
+
+    -- Creator coverage
+    COUNT(DISTINCT sender_normalized) AS active_creators,
+    COUNT(DISTINCT CASE WHEN send_date = CURRENT_DATE() THEN sender_normalized END) AS today_active_creators,
+
+    -- Performance metrics
+    SUM(earnings) AS total_earnings,
+    AVG(conversion_rate) AS overall_conversion,
+    AVG(revenue_per_message) AS overall_rpm,
+
+    -- Error rates
+    COUNTIF(ARRAY_LENGTH(anomaly_flags) > 0) AS records_with_errors,
+    COUNTIF(is_duplicate = TRUE) AS duplicate_records,
+
+    CURRENT_TIMESTAMP() AS check_time
+
+  FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+  WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+)
+
+SELECT
+  check_time,
+
+  -- Freshness status
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), latest_data_load, HOUR) AS hours_since_last_load,
+  DATE_DIFF(CURRENT_DATE(), latest_message_date, DAY) AS days_since_latest_message,
+
+  CASE
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), latest_data_load, HOUR) <= 2 THEN 'FRESH'
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), latest_data_load, HOUR) <= 24 THEN 'STALE'
+    ELSE 'VERY_STALE'
+  END AS data_freshness_status,
+
+  -- Coverage metrics
+  total_records,
+  active_creators,
+  today_active_creators,
+  days_with_data,
+
+  -- Quality metrics
+  ROUND(parsed_timestamps / total_records * 100, 2) AS timestamp_parse_rate_pct,
+  ROUND(quality_records / total_records * 100, 2) AS quality_rate_pct,
+  ROUND(records_with_errors / total_records * 100, 2) AS error_rate_pct,
+  ROUND(duplicate_records / total_records * 100, 2) AS duplicate_rate_pct,
+
+  -- Performance metrics
+  total_earnings,
+  ROUND(overall_conversion, 4) AS overall_conversion,
+  ROUND(overall_rpm, 4) AS overall_rpm,
+
+  -- Overall health status
+  CASE
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), latest_data_load, HOUR) > 24 THEN 'CRITICAL'
+    WHEN records_with_errors / total_records > 0.2 THEN 'CRITICAL'
+    WHEN quality_records / total_records < 0.5 THEN 'CRITICAL'
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), latest_data_load, HOUR) > 4 THEN 'WARNING'
+    WHEN records_with_errors / total_records > 0.1 THEN 'WARNING'
+    WHEN quality_records / total_records < 0.8 THEN 'WARNING'
+    ELSE 'HEALTHY'
+  END AS overall_health_status
+
+FROM health_metrics;
+
+-- =====================================================================
+-- STAGING TABLE MONITORING VIEW
+-- =====================================================================
+
+CREATE OR REPLACE VIEW `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_staging_status` AS
+SELECT
+  DATE(loaded_at) AS load_date,
+  COUNT(*) AS total_staged_records,
+
+  -- Processing status breakdown
+  COUNTIF(_processing_status = 'PENDING') AS pending_records,
+  COUNTIF(_processing_status = 'PROCESSING') AS processing_records,
+  COUNTIF(_processing_status = 'COMPLETED') AS completed_records,
+  COUNTIF(_processing_status = 'FAILED') AS failed_records,
+
+  -- Quality distribution
+  AVG(_quality_score) AS avg_quality_score,
+  COUNTIF(_quality_score >= 0.8) AS high_quality_records,
+  COUNTIF(_quality_score < 0.5) AS low_quality_records,
+
+  -- Source file diversity
+  COUNT(DISTINCT source_file) AS unique_source_files,
+  ARRAY_AGG(DISTINCT source_file LIMIT 10) AS sample_source_files,
+
+  -- Processing time tracking
+  MIN(loaded_at) AS first_load_time,
+  MAX(loaded_at) AS last_load_time,
+
+  CURRENT_TIMESTAMP() AS check_time
+
+FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_incoming_stage`
+WHERE loaded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+GROUP BY DATE(loaded_at)
+ORDER BY load_date DESC;
+
+-- =====================================================================
+-- SANITY CHECK PROCEDURE
+-- =====================================================================
+
+CREATE OR REPLACE PROCEDURE `${dataform.projectConfig.defaultProject}.layer_00_ingestion.sp_run_sanity_checks`()
+BEGIN
+  DECLARE check_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+  DECLARE critical_issues INT64 DEFAULT 0;
+  DECLARE warning_issues INT64 DEFAULT 0;
+
+  -- Check 1: Duplicate rate
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+    check_timestamp, table_name, check_type, metric_name,
+    metric_value, threshold_min, threshold_max, status, details
+  )
+  SELECT
+    check_timestamp,
+    'mass_message_master',
+    'CONSISTENCY',
+    'duplicate_rate',
+    (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_sanity_duplicates`) /
+    (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`),
+    NULL,
+    0.05,  -- 5% threshold
+    CASE
+      WHEN (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_sanity_duplicates`) /
+           (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`) > 0.05 THEN 'FAIL'
+      WHEN (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_sanity_duplicates`) /
+           (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`) > 0.02 THEN 'WARN'
+      ELSE 'PASS'
+    END,
+    TO_JSON_STRING(STRUCT(
+      (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_sanity_duplicates`) AS duplicate_groups,
+      (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`) AS total_records
+    ));
+
+  -- Check 2: Data freshness
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+    check_timestamp, table_name, check_type, metric_name,
+    metric_value, threshold_min, threshold_max, status, details
+  )
+  SELECT
+    check_timestamp,
+    'mass_message_master',
+    'TIMELINESS',
+    'hours_since_latest_data',
+    (SELECT hours_since_last_load FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_system_health`),
+    NULL,
+    24,  -- 24 hour threshold
+    CASE
+      WHEN (SELECT hours_since_last_load FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_system_health`) > 24 THEN 'FAIL'
+      WHEN (SELECT hours_since_last_load FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_system_health`) > 4 THEN 'WARN'
+      ELSE 'PASS'
+    END,
+    TO_JSON_STRING(STRUCT(
+      (SELECT overall_health_status FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.v_l0_system_health`) AS health_status
+    ));
+
+  -- Check 3: Quality score
+  INSERT INTO `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics` (
+    check_timestamp, table_name, check_type, metric_name,
+    metric_value, threshold_min, threshold_max, status, details
+  )
+  SELECT
+    check_timestamp,
+    'mass_message_master',
+    'ACCURACY',
+    'avg_quality_score',
+    (SELECT AVG(data_quality_score) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+     WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)),
+    0.7,  -- Minimum 70%
+    NULL,
+    CASE
+      WHEN (SELECT AVG(data_quality_score) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+            WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) < 0.5 THEN 'FAIL'
+      WHEN (SELECT AVG(data_quality_score) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+            WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) < 0.7 THEN 'WARN'
+      ELSE 'PASS'
+    END,
+    TO_JSON_STRING(STRUCT(
+      (SELECT COUNT(*) FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.mass_message_master`
+       WHERE send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) AS records_checked
+    ));
+
+  -- Count issues
+  SET critical_issues = (
+    SELECT COUNTIF(status = 'FAIL')
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics`
+    WHERE check_timestamp = check_timestamp
+  );
+
+  SET warning_issues = (
+    SELECT COUNTIF(status = 'WARN')
+    FROM `${dataform.projectConfig.defaultProject}.layer_00_ingestion.data_quality_metrics`
+    WHERE check_timestamp = check_timestamp
+  );
+
+  -- Log results
+  INSERT INTO `layer_10_metadata.build_log` (
+    layer, component, status, message, created_at
+  )
+  VALUES (
+    'L0', 'sanity_checks',
+    CASE WHEN critical_issues > 0 THEN 'FAILED' WHEN warning_issues > 0 THEN 'WARNING' ELSE 'SUCCESS' END,
+    FORMAT('Sanity checks completed: %d critical, %d warnings', critical_issues, warning_issues),
+    CURRENT_TIMESTAMP()
+  );
+
+END;
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L0', 'sanity_checks',
+  'SUCCESS',
+  'Created comprehensive data quality monitoring and anomaly detection views',
+  CURRENT_TIMESTAMP()
+);
+
+-- Success message
+SELECT
+  'L0.05 COMPLETE' as status,
+  'Created sanity checks with intelligent anomaly detection and quality monitoring' as message,
+  CURRENT_TIMESTAMP() as completed_at;

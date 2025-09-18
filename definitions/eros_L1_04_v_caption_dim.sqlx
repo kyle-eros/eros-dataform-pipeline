@@ -1,0 +1,445 @@
+config {
+  type: "view",
+  tags: ["L1", "v_caption_dim"],
+  dependencies: ["eros_L0_01_datasets_and_udfs", "eros_L0_02_core_tables"],
+  description: "====================================================================="
+}
+
+-- =====================================================================
+-- EROS L1.04: Caption Dimension - Intelligent Content Analytics
+-- =====================================================================
+-- Comprehensive caption analysis with performance tracking, similarity
+-- detection, and AI-powered content optimization recommendations.
+-- =====================================================================
+
+-- =====================================================================
+-- MAIN CAPTION DIMENSION VIEW
+-- =====================================================================
+
+WITH caption_performance AS (
+  -- Aggregate performance metrics for each unique caption
+  SELECT
+    message_hash AS caption_hash,
+    message AS caption_text,
+
+    -- Usage statistics
+    COUNT(*) AS total_usage_count,
+    COUNT(DISTINCT creator_username) AS used_by_creators_count,
+    COUNT(DISTINCT send_date) AS usage_days_count,
+    MIN(send_date) AS first_used_date,
+    MAX(send_date) AS last_used_date,
+
+    -- Performance aggregates
+    SUM(sent) AS total_sent,
+    SUM(viewed) AS total_viewed,
+    SUM(purchased) AS total_purchased,
+    SUM(earnings) AS total_earnings,
+
+    -- Average performance metrics
+    AVG(conversion_rate) AS avg_conversion_rate,
+    AVG(revenue_per_message) AS avg_rpm,
+    AVG(engagement_score) AS avg_engagement_score,
+
+    -- Performance distribution
+    STDDEV(conversion_rate) AS conversion_rate_stddev,
+    STDDEV(revenue_per_message) AS rpm_stddev,
+
+    -- Content characteristics (should be consistent across uses)
+    MAX(content_category) AS content_category,
+    MAX(char_length) AS char_length,
+    MAX(word_count) AS word_count,
+    MAX(emoji_count) AS emoji_count,
+    MAX(has_hashtag) AS has_hashtag,
+    MAX(has_mention) AS has_mention,
+    MAX(has_price_placeholder) AS has_price_placeholder,
+    MAX(has_name_placeholder) AS has_name_placeholder,
+
+    -- Quality metrics
+    AVG(data_quality_score) AS avg_quality_score,
+    AVG(novelty_score) AS avg_novelty_score,
+
+    -- Creator tier context
+    APPROX_TOP_COUNT(creator_tier, 1)[OFFSET(0)].value AS most_common_creator_tier,
+    COUNT(DISTINCT creator_tier) AS creator_tier_diversity,
+
+    -- Timing patterns
+    APPROX_TOP_COUNT(send_hour, 1)[OFFSET(0)].value AS most_common_hour,
+    APPROX_TOP_COUNT(day_category, 1)[OFFSET(0)].value AS most_common_day_category,
+    COUNT(DISTINCT send_hour) AS hour_diversity,
+
+    -- Recent performance (last 30 days)
+    AVG(CASE WHEN send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+        THEN conversion_rate END) AS recent_conversion_rate,
+    AVG(CASE WHEN send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+        THEN revenue_per_message END) AS recent_rpm,
+    COUNT(CASE WHEN send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+          THEN 1 END) AS recent_usage_count
+
+  FROM `layer_01_semantic.v_message_facts_by_page`
+  WHERE message_hash IS NOT NULL
+    AND send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)  -- 1 year window
+  GROUP BY message_hash, message
+),
+
+caption_classification AS (
+  -- Classify captions based on performance and characteristics
+  SELECT
+    *,
+
+    -- Performance percentiles within content category
+    PERCENT_RANK() OVER (
+      PARTITION BY content_category
+      ORDER BY avg_conversion_rate
+    ) AS conversion_percentile_in_category,
+
+    PERCENT_RANK() OVER (
+      PARTITION BY content_category
+      ORDER BY avg_rpm
+    ) AS rpm_percentile_in_category,
+
+    PERCENT_RANK() OVER (
+      ORDER BY avg_conversion_rate
+    ) AS conversion_percentile_overall,
+
+    PERCENT_RANK() OVER (
+      ORDER BY avg_rpm
+    ) AS rpm_percentile_overall,
+
+    -- Performance tier classification
+    CASE
+      WHEN avg_conversion_rate >= 0.10 AND avg_rpm >= 2.0 THEN 'ELITE'
+      WHEN avg_conversion_rate >= 0.08 OR avg_rpm >= 1.5 THEN 'HIGH_PERFORMER'
+      WHEN avg_conversion_rate >= 0.05 OR avg_rpm >= 1.0 THEN 'GOOD_PERFORMER'
+      WHEN avg_conversion_rate >= 0.03 OR avg_rpm >= 0.5 THEN 'AVERAGE_PERFORMER'
+      WHEN avg_conversion_rate >= 0.01 OR avg_rpm >= 0.25 THEN 'BELOW_AVERAGE'
+      ELSE 'POOR_PERFORMER'
+    END AS performance_tier,
+
+    -- Usage pattern classification
+    CASE
+      WHEN total_usage_count >= 50 THEN 'HEAVILY_USED'
+      WHEN total_usage_count >= 20 THEN 'FREQUENTLY_USED'
+      WHEN total_usage_count >= 10 THEN 'MODERATELY_USED'
+      WHEN total_usage_count >= 5 THEN 'OCCASIONALLY_USED'
+      ELSE 'RARELY_USED'
+    END AS usage_pattern,
+
+    -- Versatility classification
+    CASE
+      WHEN used_by_creators_count >= 10 AND creator_tier_diversity >= 3 THEN 'HIGHLY_VERSATILE'
+      WHEN used_by_creators_count >= 5 AND creator_tier_diversity >= 2 THEN 'MODERATELY_VERSATILE'
+      WHEN used_by_creators_count >= 3 THEN 'SOMEWHAT_VERSATILE'
+      ELSE 'CREATOR_SPECIFIC'
+    END AS versatility_classification,
+
+    -- Content length classification
+    CASE
+      WHEN char_length <= 30 THEN 'VERY_SHORT'
+      WHEN char_length <= 60 THEN 'SHORT'
+      WHEN char_length <= 120 THEN 'MEDIUM'
+      WHEN char_length <= 200 THEN 'LONG'
+      ELSE 'VERY_LONG'
+    END AS length_category,
+
+    -- Emoji usage classification
+    CASE
+      WHEN emoji_count = 0 THEN 'NO_EMOJIS'
+      WHEN emoji_count <= 2 THEN 'MINIMAL_EMOJIS'
+      WHEN emoji_count <= 5 THEN 'MODERATE_EMOJIS'
+      WHEN emoji_count <= 10 THEN 'HEAVY_EMOJIS'
+      ELSE 'EMOJI_HEAVY'
+    END AS emoji_usage_category,
+
+    -- Trend analysis
+    CASE
+      WHEN recent_usage_count > 0 THEN
+        COALESCE((recent_conversion_rate - avg_conversion_rate) / NULLIF(avg_conversion_rate, 0), 0)
+      ELSE NULL
+    END AS recent_conversion_trend,
+
+    CASE
+      WHEN recent_usage_count > 0 THEN
+        COALESCE((recent_rpm - avg_rpm) / NULLIF(avg_rpm, 0), 0)
+      ELSE NULL
+    END AS recent_rpm_trend
+
+  FROM caption_performance
+),
+
+content_intelligence AS (
+  -- Add AI-powered content analysis and recommendations
+  SELECT
+    *,
+
+    -- Content sophistication score
+    (
+      CASE WHEN word_count >= 10 THEN 0.2 ELSE 0.0 END +
+      CASE WHEN emoji_count BETWEEN 1 AND 5 THEN 0.2 ELSE 0.0 END +
+      CASE WHEN has_price_placeholder THEN 0.2 ELSE 0.0 END +
+      CASE WHEN has_name_placeholder THEN 0.2 ELSE 0.0 END +
+      CASE WHEN char_length BETWEEN 50 AND 150 THEN 0.2 ELSE 0.0 END
+    ) AS content_sophistication_score,
+
+    -- Optimization potential
+    CASE
+      WHEN performance_tier IN ('POOR_PERFORMER', 'BELOW_AVERAGE') AND usage_pattern IN ('HEAVILY_USED', 'FREQUENTLY_USED') THEN 'HIGH'
+      WHEN performance_tier = 'AVERAGE_PERFORMER' AND usage_pattern IN ('HEAVILY_USED', 'FREQUENTLY_USED') THEN 'MEDIUM'
+      WHEN performance_tier IN ('HIGH_PERFORMER', 'ELITE') AND usage_pattern = 'RARELY_USED' THEN 'SCALE_UP'
+      ELSE 'LOW'
+    END AS optimization_potential,
+
+    -- Content recommendations
+    ARRAY(
+      SELECT recommendation FROM UNNEST([
+        CASE WHEN char_length < 20 THEN 'Consider adding more detail or context' END,
+        CASE WHEN char_length > 250 THEN 'Consider shortening for better engagement' END,
+        CASE WHEN emoji_count = 0 AND content_category != 'RENEW' THEN 'Add emojis for better visual appeal' END,
+        CASE WHEN emoji_count > 10 THEN 'Reduce emoji count for professionalism' END,
+        CASE WHEN NOT has_price_placeholder AND content_category = 'PPV' THEN 'Add price placeholder for flexibility' END,
+        CASE WHEN NOT has_name_placeholder AND versatility_classification = 'CREATOR_SPECIFIC' THEN 'Add name placeholder for reusability' END,
+        CASE WHEN word_count < 5 THEN 'Add more engaging content' END,
+        CASE WHEN performance_tier = 'POOR_PERFORMER' AND total_usage_count > 5 THEN 'Consider retiring this caption' END,
+        CASE WHEN performance_tier IN ('HIGH_PERFORMER', 'ELITE') AND total_usage_count < 10 THEN 'Scale usage of this high-performing caption' END
+      ]) AS recommendation
+      WHERE recommendation IS NOT NULL
+    ) AS content_recommendations,
+
+    -- Similar content suggestions (placeholder for ML enhancement)
+    ARRAY<STRING>[] AS similar_captions,  -- To be populated by ML similarity model
+
+    -- A/B testing eligibility
+    CASE
+      WHEN total_usage_count >= 10
+        AND performance_tier IN ('AVERAGE_PERFORMER', 'GOOD_PERFORMER')
+        AND recent_usage_count >= 3
+      THEN TRUE
+      ELSE FALSE
+    END AS ab_testing_eligible,
+
+    -- Seasonal performance indicators
+    CASE
+      WHEN EXTRACT(MONTH FROM first_used_date) IN (11, 12, 1) THEN 'WINTER_CONTENT'
+      WHEN EXTRACT(MONTH FROM first_used_date) IN (2, 3, 4) THEN 'SPRING_CONTENT'
+      WHEN EXTRACT(MONTH FROM first_used_date) IN (5, 6, 7) THEN 'SUMMER_CONTENT'
+      WHEN EXTRACT(MONTH FROM first_used_date) IN (8, 9, 10) THEN 'FALL_CONTENT'
+      ELSE 'YEAR_ROUND'
+    END AS seasonal_category
+
+  FROM caption_classification
+)
+
+-- Main view query
+SELECT
+  caption_hash,
+  caption_text,
+
+  -- Basic statistics
+  total_usage_count,
+  used_by_creators_count,
+  usage_days_count,
+  first_used_date,
+  last_used_date,
+  DATE_DIFF(CURRENT_DATE(), last_used_date, DAY) AS days_since_last_use,
+
+  -- Content characteristics
+  content_category,
+  char_length,
+  word_count,
+  emoji_count,
+  has_hashtag,
+  has_mention,
+  has_price_placeholder,
+  has_name_placeholder,
+  length_category,
+  emoji_usage_category,
+
+  -- Performance metrics
+  total_sent,
+  total_viewed,
+  total_purchased,
+  total_earnings,
+  ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+  ROUND(avg_rpm, 4) AS avg_rpm,
+  ROUND(avg_engagement_score, 4) AS avg_engagement_score,
+
+  -- Performance consistency
+  ROUND(conversion_rate_stddev, 4) AS conversion_rate_stddev,
+  ROUND(rpm_stddev, 4) AS rpm_stddev,
+
+  -- Classifications
+  performance_tier,
+  usage_pattern,
+  versatility_classification,
+
+  -- Performance rankings
+  ROUND(conversion_percentile_in_category, 3) AS conversion_percentile_in_category,
+  ROUND(rpm_percentile_in_category, 3) AS rpm_percentile_in_category,
+  ROUND(conversion_percentile_overall, 3) AS conversion_percentile_overall,
+  ROUND(rpm_percentile_overall, 3) AS rpm_percentile_overall,
+
+  -- Quality and sophistication
+  ROUND(avg_quality_score, 3) AS avg_quality_score,
+  ROUND(avg_novelty_score, 3) AS avg_novelty_score,
+  ROUND(content_sophistication_score, 3) AS content_sophistication_score,
+
+  -- Creator and usage patterns
+  most_common_creator_tier,
+  creator_tier_diversity,
+  most_common_hour,
+  most_common_day_category,
+  hour_diversity,
+
+  -- Recent performance
+  recent_usage_count,
+  ROUND(recent_conversion_rate, 4) AS recent_conversion_rate,
+  ROUND(recent_rpm, 4) AS recent_rpm,
+  ROUND(recent_conversion_trend, 4) AS recent_conversion_trend,
+  ROUND(recent_rpm_trend, 4) AS recent_rpm_trend,
+
+  -- AI insights
+  optimization_potential,
+  content_recommendations,
+  similar_captions,
+  ab_testing_eligible,
+  seasonal_category,
+
+  -- Calculated metrics
+  ROUND(total_earnings / GREATEST(total_usage_count, 1), 4) AS earnings_per_use,
+  ROUND(total_earnings / GREATEST(total_sent, 1), 4) AS earnings_per_send,
+  ROUND(total_purchased / GREATEST(total_viewed, 1), 4) AS overall_conversion_rate,
+
+  -- Metadata
+  CURRENT_TIMESTAMP() AS caption_analyzed_at
+
+FROM content_intelligence
+ORDER BY avg_rpm DESC, total_earnings DESC
+
+-- =====================================================================
+-- HIGH-PERFORMING CAPTIONS VIEW
+-- =====================================================================
+
+
+SELECT
+  caption_hash,
+  caption_text,
+  content_category,
+  performance_tier,
+
+  -- Key metrics
+  total_usage_count,
+  avg_conversion_rate,
+  avg_rpm,
+  total_earnings,
+
+  -- Why it's high-performing
+  ARRAY_CONCAT(
+    CASE WHEN conversion_percentile_overall >= 0.8 THEN ['HIGH_CONVERSION'] ELSE [] END,
+    CASE WHEN rpm_percentile_overall >= 0.8 THEN ['HIGH_RPM'] ELSE [] END,
+    CASE WHEN total_earnings >= 1000 THEN ['HIGH_TOTAL_EARNINGS'] ELSE [] END,
+    CASE WHEN versatility_classification = 'HIGHLY_VERSATILE' THEN ['VERSATILE'] ELSE [] END,
+    CASE WHEN content_sophistication_score >= 0.8 THEN ['SOPHISTICATED'] ELSE [] END
+  ) AS success_factors,
+
+  -- Replication guidance
+  length_category,
+  emoji_usage_category,
+  has_price_placeholder,
+  has_name_placeholder,
+  most_common_creator_tier,
+  most_common_hour,
+
+  -- Scaling opportunity
+  CASE
+    WHEN total_usage_count < 20 AND performance_tier IN ('HIGH_PERFORMER', 'ELITE') THEN 'HIGH_SCALE_POTENTIAL'
+    WHEN total_usage_count < 50 AND performance_tier = 'ELITE' THEN 'MEDIUM_SCALE_POTENTIAL'
+    ELSE 'ALREADY_SCALED'
+  END AS scale_potential,
+
+  caption_analyzed_at
+
+FROM `layer_01_semantic.v_caption_dim`
+WHERE performance_tier IN ('HIGH_PERFORMER', 'ELITE')
+  AND total_usage_count >= 5  -- Statistically significant
+  AND avg_conversion_rate >= 0.05  -- Meaningful conversion rate
+ORDER BY avg_rpm DESC, total_earnings DESC
+LIMIT 500
+
+-- =====================================================================
+-- CONTENT OPTIMIZATION CANDIDATES VIEW
+-- =====================================================================
+
+
+SELECT
+  caption_hash,
+  caption_text,
+  content_category,
+  performance_tier,
+  optimization_potential,
+
+  -- Usage justifying optimization
+  total_usage_count,
+  used_by_creators_count,
+  recent_usage_count,
+
+  -- Performance gaps
+  avg_conversion_rate,
+  avg_rpm,
+  conversion_percentile_in_category,
+  rpm_percentile_in_category,
+
+  -- Specific issues
+  content_recommendations,
+
+  -- Improvement suggestions
+  CASE
+    WHEN char_length < 30 AND performance_tier = 'POOR_PERFORMER' THEN 'Expand content with more detail'
+    WHEN emoji_count = 0 AND content_category IN ('PPV', 'BUMP') THEN 'Add engaging emojis'
+    WHEN NOT has_price_placeholder AND content_category = 'PPV' THEN 'Add price flexibility'
+    WHEN conversion_rate_stddev > avg_conversion_rate THEN 'Inconsistent performance - review usage context'
+    WHEN recent_conversion_trend < -0.2 THEN 'Performance declining - needs refresh'
+    ELSE 'General performance improvement needed'
+  END AS primary_improvement_suggestion,
+
+  -- Expected impact
+  CASE
+    WHEN optimization_potential = 'HIGH' AND total_usage_count >= 20 THEN 'HIGH_IMPACT'
+    WHEN optimization_potential = 'MEDIUM' AND total_usage_count >= 10 THEN 'MEDIUM_IMPACT'
+    ELSE 'LOW_IMPACT'
+  END AS expected_optimization_impact,
+
+  days_since_last_use,
+  caption_analyzed_at
+
+FROM `layer_01_semantic.v_caption_dim`
+WHERE optimization_potential IN ('HIGH', 'MEDIUM')
+  AND total_usage_count >= 5
+  AND days_since_last_use <= 90  -- Still relevant
+ORDER BY
+  CASE
+    WHEN optimization_potential = 'HIGH' THEN 1
+    WHEN optimization_potential = 'MEDIUM' THEN 2
+    ELSE 3
+  END,
+  total_usage_count DESC,
+  avg_rpm ASC;  -- Lowest performing first within each potential category
+
+-- =====================================================================
+-- METADATA LOGGING
+-- =====================================================================
+
+-- Log successful creation
+INSERT INTO `layer_10_metadata.build_log` (
+  layer, component, status, message, created_at
+)
+VALUES (
+  'L1', 'caption_dim',
+  'SUCCESS',
+  'Created intelligent caption dimension views with performance analytics and content optimization',
+  CURRENT_TIMESTAMP()
+)
+
+-- Success message
+SELECT
+  'L1.04 COMPLETE' as status,
+  'Caption dimension views created with AI-powered content analytics and optimization recommendations' as message,
+  CURRENT_TIMESTAMP() as completed_at

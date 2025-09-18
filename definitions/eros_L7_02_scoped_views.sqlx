@@ -1,0 +1,476 @@
+config {
+  type: "operations",
+  hasOutput: false,
+  tags: ["L7", "scoped_views"],
+  dependencies: ["eros_L6_01_config"],
+  description: "================================================================"
+}
+
+-- ================================================================
+-- EROS L7.02: Role-Based Scoped Views and Access Control
+-- ================================================================
+-- Creates role-specific views with appropriate data access
+-- Implements principle of least privilege for different user roles
+-- ================================================================
+
+-- Executive Dashboard View - High-level business metrics only
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_executive_dashboard` AS
+WITH business_summary AS (
+  SELECT
+    DATE(sending_time) AS business_date,
+    COUNT(DISTINCT sender) AS active_creators,
+    COUNT(*) AS total_messages,
+    SUM(earnings) AS total_revenue,
+    AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) AS avg_view_rate,
+    AVG(CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END) AS avg_conversion_rate
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND sent > 0
+  GROUP BY DATE(sending_time)
+),
+
+growth_metrics AS (
+  SELECT
+    business_date,
+    active_creators,
+    total_messages,
+    total_revenue,
+    ROUND(avg_view_rate, 4) AS avg_view_rate,
+    ROUND(avg_conversion_rate, 4) AS avg_conversion_rate,
+
+    -- Growth calculations
+    LAG(total_revenue, 7) OVER (ORDER BY business_date) AS revenue_7d_ago,
+    LAG(active_creators, 7) OVER (ORDER BY business_date) AS creators_7d_ago,
+    LAG(total_messages, 7) OVER (ORDER BY business_date) AS messages_7d_ago,
+
+    -- Weekly moving averages
+    AVG(total_revenue) OVER (
+      ORDER BY business_date
+      ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) AS revenue_7d_avg,
+
+    AVG(avg_view_rate) OVER (
+      ORDER BY business_date
+      ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) AS view_rate_7d_trend
+
+  FROM business_summary
+)
+
+SELECT
+  business_date,
+  active_creators,
+  total_messages,
+  ROUND(total_revenue, 2) AS total_revenue,
+  avg_view_rate,
+  avg_conversion_rate,
+
+  -- Growth rates
+  CASE
+    WHEN revenue_7d_ago > 0
+    THEN ROUND((total_revenue - revenue_7d_ago) / revenue_7d_ago * 100, 1)
+    ELSE NULL
+  END AS revenue_growth_7d_percent,
+
+  CASE
+    WHEN creators_7d_ago > 0
+    THEN ROUND((active_creators - creators_7d_ago) / CAST(creators_7d_ago AS FLOAT64) * 100, 1)
+    ELSE NULL
+  END AS creator_growth_7d_percent,
+
+  -- Trends
+  ROUND(revenue_7d_avg, 2) AS revenue_7d_trend,
+  ROUND(view_rate_7d_trend, 4) AS engagement_7d_trend,
+
+  -- Performance indicators
+  CASE
+    WHEN total_revenue > revenue_7d_avg * 1.1 THEN '📈 STRONG'
+    WHEN total_revenue > revenue_7d_avg * 0.9 THEN '➡️ STABLE'
+    ELSE '📉 DECLINING'
+  END AS revenue_trend_indicator,
+
+  CASE
+    WHEN avg_view_rate > view_rate_7d_trend * 1.05 THEN '🟢 IMPROVING'
+    WHEN avg_view_rate > view_rate_7d_trend * 0.95 THEN '🟡 STABLE'
+    ELSE '🔴 DECLINING'
+  END AS engagement_trend_indicator
+
+FROM growth_metrics
+WHERE business_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+ORDER BY business_date DESC
+
+
+-- Scheduler Dashboard View - Creator-specific operational data
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_scheduler_dashboard` AS
+WITH scheduler_assignments AS (
+  SELECT DISTINCT
+    scheduler_email,
+    creator_name
+  FROM `of-scheduler-proj.governance.scheduler_assignments`
+  WHERE scheduler_email = SESSION_USER()
+),
+
+creator_performance AS (
+  SELECT
+    m.sender AS creator_name,
+
+    -- Recent performance (last 24 hours)
+    COUNT(CASE WHEN DATE(m.sending_time) = CURRENT_DATE() THEN 1 END) AS messages_today,
+    SUM(CASE WHEN DATE(m.sending_time) = CURRENT_DATE() THEN m.earnings ELSE 0 END) AS revenue_today,
+    AVG(CASE
+      WHEN DATE(m.sending_time) = CURRENT_DATE() AND m.viewed > 0
+      THEN m.viewed / GREATEST(m.sent, 1)
+      ELSE NULL
+    END) AS view_rate_today,
+
+    -- Weekly performance
+    COUNT(CASE WHEN DATE(m.sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN 1 END) AS messages_7d,
+    SUM(CASE WHEN DATE(m.sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) THEN m.earnings ELSE 0 END) AS revenue_7d,
+    AVG(CASE
+      WHEN DATE(m.sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND m.viewed > 0
+      THEN m.viewed / GREATEST(m.sent, 1)
+      ELSE NULL
+    END) AS view_rate_7d,
+
+    -- Last activity
+    MAX(m.sending_time) AS last_message_time,
+
+    -- Performance trends
+    AVG(CASE
+      WHEN DATE(m.sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+           AND DATE(m.sending_time) < DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+           AND m.viewed > 0
+      THEN m.viewed / GREATEST(m.sent, 1)
+      ELSE NULL
+    END) AS view_rate_prev_7d
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master` m
+  INNER JOIN scheduler_assignments sa ON m.sender = sa.creator_name
+  WHERE DATE(m.sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+    AND m.sent > 0
+  GROUP BY m.sender
+),
+
+ml_recommendations AS (
+  SELECT
+    creator_name,
+    COUNT(*) AS available_slots,
+    AVG(ml_enhanced_score) AS avg_ml_score,
+    MIN(slot_time) AS next_recommended_time,
+    COUNTIF(recommendation_quality = 'EXCELLENT') AS excellent_slots
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+  WHERE creator_name IN (SELECT creator_name FROM scheduler_assignments)
+  GROUP BY creator_name
+)
+
+SELECT
+  p.creator_name,
+
+  -- Today's performance
+  p.messages_today,
+  ROUND(p.revenue_today, 2) AS revenue_today,
+  ROUND(p.view_rate_today, 4) AS view_rate_today,
+
+  -- Weekly performance
+  p.messages_7d,
+  ROUND(p.revenue_7d, 2) AS revenue_7d,
+  ROUND(p.view_rate_7d, 4) AS view_rate_7d,
+
+  -- Timing information
+  p.last_message_time,
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), p.last_message_time, HOUR) AS hours_since_last_message,
+
+  -- Performance trends
+  CASE
+    WHEN p.view_rate_prev_7d > 0
+    THEN ROUND((p.view_rate_7d - p.view_rate_prev_7d) / p.view_rate_prev_7d * 100, 1)
+    ELSE NULL
+  END AS view_rate_change_percent,
+
+  -- ML recommendations
+  COALESCE(r.available_slots, 0) AS available_ml_slots,
+  ROUND(COALESCE(r.avg_ml_score, 0), 2) AS avg_ml_score,
+  r.next_recommended_time,
+  COALESCE(r.excellent_slots, 0) AS excellent_slots,
+
+  -- Status indicators
+  CASE
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), p.last_message_time, HOUR) > 24 THEN '🔴 INACTIVE'
+    WHEN p.messages_today = 0 THEN '🟡 NO_MESSAGES_TODAY'
+    WHEN p.view_rate_today < 0.05 THEN '🟠 LOW_ENGAGEMENT'
+    ELSE '🟢 ACTIVE'
+  END AS status,
+
+  CASE
+    WHEN r.excellent_slots > 0 THEN '🎯 EXCELLENT_OPPORTUNITIES'
+    WHEN r.available_slots > 0 THEN '📊 RECOMMENDATIONS_AVAILABLE'
+    ELSE '⏳ NO_RECOMMENDATIONS'
+  END AS ml_status,
+
+  -- Action recommendations
+  CASE
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), p.last_message_time, HOUR) > 24
+    THEN 'Schedule message immediately'
+    WHEN r.excellent_slots > 0
+    THEN 'Use ML excellent slot recommendations'
+    WHEN p.view_rate_today < p.view_rate_7d * 0.8
+    THEN 'Review message timing and content'
+    ELSE 'Continue current strategy'
+  END AS recommended_action
+
+FROM creator_performance p
+LEFT JOIN ml_recommendations r ON p.creator_name = r.creator_name
+ORDER BY
+  CASE
+    WHEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), p.last_message_time, HOUR) > 24 THEN 1
+    WHEN p.messages_today = 0 THEN 2
+    ELSE 3
+  END,
+  r.avg_ml_score DESC
+
+
+-- Analytics Team View - Aggregated insights without PII
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_analytics_dashboard` AS
+WITH performance_cohorts AS (
+  SELECT
+    -- Creator tier groupings (anonymized)
+    CASE
+      WHEN AVG(earnings / GREATEST(sent, 1)) > 50 THEN 'HIGH_REVENUE'
+      WHEN AVG(earnings / GREATEST(sent, 1)) > 20 THEN 'MEDIUM_REVENUE'
+      ELSE 'LOW_REVENUE'
+    END AS revenue_cohort,
+
+    CASE
+      WHEN AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) > 0.15 THEN 'HIGH_ENGAGEMENT'
+      WHEN AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) > 0.08 THEN 'MEDIUM_ENGAGEMENT'
+      ELSE 'LOW_ENGAGEMENT'
+    END AS engagement_cohort,
+
+    -- Aggregated metrics
+    COUNT(DISTINCT sender) AS creators_in_cohort,
+    COUNT(*) AS total_messages,
+    SUM(earnings) AS total_revenue,
+    AVG(earnings / GREATEST(sent, 1)) AS avg_revenue_per_message,
+    AVG(CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END) AS avg_view_rate,
+    AVG(CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END) AS avg_conversion_rate,
+
+    -- Timing analysis
+    MODE() OVER (
+      PARTITION BY
+        CASE
+          WHEN AVG(earnings / GREATEST(sent, 1)) > 50 THEN 'HIGH_REVENUE'
+          WHEN AVG(earnings / GREATEST(sent, 1)) > 20 THEN 'MEDIUM_REVENUE'
+          ELSE 'LOW_REVENUE'
+        END
+    ) AS most_common_hour
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND sent > 0
+  GROUP BY sender
+),
+
+ml_performance_analysis AS (
+  SELECT
+    -- Anonymized ML performance metrics
+    COUNT(*) AS total_predictions,
+    AVG(ml_enhanced_score) AS avg_ml_score,
+    COUNTIF(recommendation_quality = 'EXCELLENT') AS excellent_predictions,
+    COUNTIF(prediction_confidence = 'HIGH') AS high_confidence_predictions,
+
+    -- Score distribution
+    COUNTIF(ml_enhanced_score > 50) AS high_score_predictions,
+    COUNTIF(ml_enhanced_score BETWEEN 30 AND 50) AS medium_score_predictions,
+    COUNTIF(ml_enhanced_score < 30) AS low_score_predictions,
+
+    AVG(predicted_view_rate) AS avg_predicted_view_rate,
+    AVG(predicted_conversion_rate) AS avg_predicted_conversion_rate
+
+  FROM `of-scheduler-proj.layer_04_ml.next24_ml_recommendations_latest`
+)
+
+SELECT
+  CURRENT_TIMESTAMP() AS analysis_timestamp,
+
+  -- Cohort analysis
+  ARRAY(
+    SELECT AS STRUCT
+      revenue_cohort,
+      engagement_cohort,
+      creators_in_cohort,
+      total_messages,
+      ROUND(total_revenue, 2) AS total_revenue,
+      ROUND(avg_revenue_per_message, 2) AS avg_revenue_per_message,
+      ROUND(avg_view_rate, 4) AS avg_view_rate,
+      ROUND(avg_conversion_rate, 4) AS avg_conversion_rate
+    FROM (
+      SELECT
+        revenue_cohort,
+        engagement_cohort,
+        SUM(creators_in_cohort) AS creators_in_cohort,
+        SUM(total_messages) AS total_messages,
+        SUM(total_revenue) AS total_revenue,
+        AVG(avg_revenue_per_message) AS avg_revenue_per_message,
+        AVG(avg_view_rate) AS avg_view_rate,
+        AVG(avg_conversion_rate) AS avg_conversion_rate
+      FROM performance_cohorts
+      GROUP BY revenue_cohort, engagement_cohort
+    )
+    ORDER BY total_revenue DESC
+  ) AS cohort_analysis,
+
+  -- ML performance summary
+  (SELECT total_predictions FROM ml_performance_analysis) AS ml_total_predictions,
+  (SELECT ROUND(avg_ml_score, 2) FROM ml_performance_analysis) AS ml_avg_score,
+  (SELECT excellent_predictions FROM ml_performance_analysis) AS ml_excellent_predictions,
+  (SELECT ROUND(excellent_predictions / CAST(total_predictions AS FLOAT64) * 100, 1)
+   FROM ml_performance_analysis) AS ml_excellent_percentage,
+
+  -- Performance distribution
+  STRUCT(
+    (SELECT high_score_predictions FROM ml_performance_analysis) AS high_score_count,
+    (SELECT medium_score_predictions FROM ml_performance_analysis) AS medium_score_count,
+    (SELECT low_score_predictions FROM ml_performance_analysis) AS low_score_count,
+    (SELECT ROUND(avg_predicted_view_rate, 4) FROM ml_performance_analysis) AS avg_predicted_view_rate,
+    (SELECT ROUND(avg_predicted_conversion_rate, 4) FROM ml_performance_analysis) AS avg_predicted_conversion_rate
+  ) AS ml_distribution,
+
+  -- Insights and trends
+  (SELECT
+    CASE
+      WHEN SUM(CASE WHEN revenue_cohort = 'HIGH_REVENUE' THEN creators_in_cohort ELSE 0 END) >
+           SUM(CASE WHEN revenue_cohort = 'LOW_REVENUE' THEN creators_in_cohort ELSE 0 END)
+      THEN 'Revenue distribution skewed toward high performers'
+      ELSE 'Revenue distribution balanced across cohorts'
+    END
+   FROM performance_cohorts) AS revenue_distribution_insight,
+
+  (SELECT
+    CASE
+      WHEN AVG(avg_view_rate) > 0.12 THEN 'Overall engagement above target'
+      WHEN AVG(avg_view_rate) > 0.08 THEN 'Overall engagement at target'
+      ELSE 'Overall engagement below target'
+    END
+   FROM performance_cohorts) AS engagement_insight
+
+
+-- Content Moderator View - Message content with safety context
+CREATE OR REPLACE VIEW `of-scheduler-proj.layer_07_security.v_content_moderation_dashboard` AS
+WITH recent_messages AS (
+  SELECT
+    message_id,
+    TO_BASE64(SHA256(sender))[OFFSET(0):8] AS creator_hash,  -- Anonymized creator ID
+    message,
+    sending_time,
+    sent,
+    viewed,
+    purchased,
+
+    -- Content analysis flags
+    LENGTH(message) AS message_length,
+    ARRAY_LENGTH(SPLIT(message, ' ')) AS word_count,
+
+    -- Content pattern detection
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'\$[0-9]+') THEN 1 ELSE 0 END AS has_price,
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'exclusive|special|limited') THEN 1 ELSE 0 END AS has_urgency,
+    CASE WHEN REGEXP_CONTAINS(LOWER(message), r'free|tip|help|support') THEN 1 ELSE 0 END AS has_request,
+
+    -- Performance metrics for content quality assessment
+    CASE WHEN viewed > 0 THEN viewed / GREATEST(sent, 1) ELSE 0 END AS view_rate,
+    CASE WHEN purchased > 0 THEN purchased / GREATEST(viewed, 1) ELSE 0 END AS conversion_rate
+
+  FROM `of-scheduler-proj.layer_00_ingestion.mass_message_master`
+  WHERE DATE(sending_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+    AND sent > 0
+),
+
+content_quality_analysis AS (
+  SELECT
+    message_id,
+    creator_hash,
+    message,
+    sending_time,
+    message_length,
+    word_count,
+    has_price,
+    has_urgency,
+    has_request,
+    ROUND(view_rate, 4) AS view_rate,
+    ROUND(conversion_rate, 4) AS conversion_rate,
+
+    -- Content quality score
+    CASE
+      WHEN view_rate > 0.15 AND conversion_rate > 0.08 THEN 'HIGH_QUALITY'
+      WHEN view_rate > 0.08 AND conversion_rate > 0.04 THEN 'MEDIUM_QUALITY'
+      ELSE 'LOW_QUALITY'
+    END AS content_quality,
+
+    -- Flags for review
+    CASE
+      WHEN message_length > 500 THEN 'LONG_MESSAGE'
+      WHEN message_length < 20 THEN 'SHORT_MESSAGE'
+      WHEN word_count > 100 THEN 'VERBOSE'
+      WHEN REGEXP_CONTAINS(UPPER(message), r'[A-Z]{5,}') THEN 'EXCESSIVE_CAPS'
+      WHEN REGEXP_CONTAINS(message, r'[!]{3,}') THEN 'EXCESSIVE_PUNCTUATION'
+      ELSE 'NORMAL'
+    END AS content_flag,
+
+    -- Performance ranking within creator
+    ROW_NUMBER() OVER (
+      PARTITION BY creator_hash
+      ORDER BY view_rate * conversion_rate DESC
+    ) AS performance_rank_within_creator
+
+  FROM recent_messages
+),
+
+flagged_content AS (
+  SELECT
+    *,
+    CASE
+      WHEN content_flag != 'NORMAL' THEN true
+      WHEN content_quality = 'LOW_QUALITY' AND performance_rank_within_creator <= 3 THEN true
+      ELSE false
+    END AS needs_review
+
+  FROM content_quality_analysis
+)
+
+SELECT
+  creator_hash,
+  message,
+  sending_time,
+  message_length,
+  word_count,
+  content_quality,
+  content_flag,
+  view_rate,
+  conversion_rate,
+  needs_review,
+
+  -- Review context
+  CASE content_flag
+    WHEN 'LONG_MESSAGE' THEN 'Message exceeds recommended length - check for clarity'
+    WHEN 'SHORT_MESSAGE' THEN 'Message may be too brief - check for completeness'
+    WHEN 'VERBOSE' THEN 'High word count - review for conciseness'
+    WHEN 'EXCESSIVE_CAPS' THEN 'Excessive capitalization detected'
+    WHEN 'EXCESSIVE_PUNCTUATION' THEN 'Excessive punctuation marks detected'
+    ELSE 'Standard content format'
+  END AS review_guidance,
+
+  -- Content insights
+  CONCAT(
+    'Price mention: ', IF(has_price = 1, 'Yes', 'No'), ' | ',
+    'Urgency language: ', IF(has_urgency = 1, 'Yes', 'No'), ' | ',
+    'Contains request: ', IF(has_request = 1, 'Yes', 'No')
+  ) AS content_features,
+
+  performance_rank_within_creator
+
+FROM flagged_content
+WHERE needs_review = true
+   OR content_quality = 'HIGH_QUALITY'  -- Include high-quality examples
+ORDER BY
+  CASE WHEN needs_review THEN 1 ELSE 2 END,
+  sending_time DESC
+LIMIT 100  -- Limit for manageable review workload
